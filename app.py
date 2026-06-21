@@ -45,9 +45,13 @@ from tribescore.windowing import stitch
 logger = logging.getLogger("tribescore.app")
 logging.basicConfig(level=logging.INFO)
 
-# whisperx (pulled in by tribev2) runs through an old huggingface_hub; disable
-# hf_transfer to match the proven reference Space (cbensimon/tribe-v2-demo).
-os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
+# whisperx (pulled in by tribev2) runs via `uvx` in an isolated env that has NO
+# hf_transfer. The Space pre-sets HF_HUB_ENABLE_HF_TRANSFER=1, which the whisperx
+# subprocess inherits -> its hub download raises "hf_transfer not available".
+# FORCE it off (hard set, not setdefault) so the subprocess inherits 0 — exactly
+# as the proven reference Space (cbensimon/tribe-v2-demo) does. Affects every
+# ASR path (text mode + non-audio_only video/audio).
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 
 # --- constants --------------------------------------------------------------
 GPU_DURATION_S = 480          # ZeroGPU reservation per Run (§7; reference uses 480)
