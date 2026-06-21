@@ -142,7 +142,16 @@ def _gpu_infer(mode: str, src_path: str, audio_only: bool):
             _torch.cuda.reset_peak_memory_stats()
     except Exception:
         _torch = None
-    out = run_inference(model, mode, src_path, audio_only=audio_only)
+    # bf16 autocast on the heavy backbones (V-JEPA2 / W2V-BERT / LLaMA): ~1.5-2x
+    # faster + ~half the activation memory. Safe here — they're LayerNorm
+    # transformers (no cross-sample mixing) and every output is z-scored
+    # downstream, so bf16 only adds float-order noise. autocast keeps fp32 master
+    # weights and falls back to fp32 for unsupported ops.
+    if _torch is not None and _torch.cuda.is_available():
+        with _torch.autocast("cuda", dtype=_torch.bfloat16):
+            out = run_inference(model, mode, src_path, audio_only=audio_only)
+    else:
+        out = run_inference(model, mode, src_path, audio_only=audio_only)
     try:
         if _torch is not None and _torch.cuda.is_available():
             logger.info("PEAK_VRAM_GB=%.2f", _torch.cuda.max_memory_allocated() / 1e9)
