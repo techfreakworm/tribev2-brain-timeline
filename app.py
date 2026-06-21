@@ -176,9 +176,13 @@ def _gpu_infer(mode: str, src_path: str, audio_only: bool):
     # previously made outputs bf16 and broke tribev2's internal .numpy()).
     # V-JEPA2 only; audio/text/head stay fp32. TF32 also on.
     try:
-        from tribescore.patches import apply_bf16_video_encode, apply_batched_video_encode
+        # bf16 on the V-JEPA2 encode (~2.2x; the real win). Clip-batching
+        # (apply_batched_video_encode, kept in patches.py) is correctness-validated
+        # — metrics match bs=1 — but NOT a speedup here: ViT-g is compute-bound, so
+        # B=4 (~231s) was slower than per-clip bf16 (~173s) and B=8 OOMs 48GB.
+        # Left unused; bf16 is the encode win.
+        from tribescore.patches import apply_bf16_video_encode
         apply_bf16_video_encode()
-        apply_batched_video_encode(batch_size=4)  # batch the V-JEPA2 loop (B=4 ~32GB/48 safe)
     except Exception:
         pass
     out = run_inference(model, mode, src_path, audio_only=audio_only)
