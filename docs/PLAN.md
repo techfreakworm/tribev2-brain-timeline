@@ -210,7 +210,7 @@ Exact signatures (coders implement to these; all heavy calls behind the injected
   - `load_model(cache_dir: str) -> "TribeModel"`: `TribeModel.from_pretrained("facebook/tribev2", cache_folder=cache_dir, device="auto", config_update={"data.overlap_trs_train": 20})`. Module-level singleton; **guarded import** of `tribev2`/`torch` so the file imports locally without them (raise a clear error only if `load_model` is actually called off-Space).
   - `run_inference(model, mode: str, src_path: str, *, audio_only: bool=False) -> tuple[np.ndarray, np.ndarray]`: normal path `events = model.get_events_dataframe(**{f"{mode}_path": src_path})` (mode ∈ `{"video","audio","text"}`). **Interim `audio_only`** (video/audio modes only; skips ASR + Llama): build the one-row event DataFrame exactly as `get_events_dataframe` does — `pd.DataFrame([{"type": "Video"|"Audio", "filepath": src_path, "start": 0, "timeline": "default", "subject": "default"}])` — then `events = get_audio_and_text_events(df, audio_only=True)`. Either way: `preds, segs = model.predict(events)`; return `preds (R,20484)`, `abs_times = np.array([round(s.start) for s in segs], float)`. **Caller wraps this in `@spaces.GPU(duration=480)`.**
   - (Fallback only) `infer_window(model, clip_path: str, window_start: float) -> tuple[np.ndarray,np.ndarray]` per §4 Fallback.
-- **T-B `windowing.py`** — `plan_windows(duration_s, win_s=100, hop_s=80)` and `stitch(preds, abs_times, *, warmup_trim=5, hop_s=80, win_s=100)` **exactly per §4** (signatures, z-score, Hann weights, overlap-add, zero-weight assert). **Unit tests with synthetic `infer_fn`** (overlapping ramps/sines) asserting shape, monotone `t_axis`, seam continuity, warm-up exclusion, duplicate averaging. *(core; no model)*
+- **T-B `windowing.py`** — `plan_windows(duration_s, win_s=100, hop_s=80)` and `stitch(preds, abs_times, *, warmup_trim=5, hop_s=80, win_s=100)` **exactly per §4** (signatures, z-score, trapezoidal weights, overlap-add, zero-weight assert). **Unit tests with synthetic `infer_fn`** (overlapping ramps/sines) asserting shape, monotone `t_axis`, seam continuity, warm-up exclusion, duplicate averaging. *(core; no model)*
 - **T-C `metrics.py`** — `PARCELS: dict[str, list[str]]` constant (§5 tables); `build_roi_masks(cache_dir, mesh="fsaverage5") -> dict[str,np.ndarray]` (validate keys against `get_hcp_labels(...).keys()`, `.npz` cache, startup pre-warm); `to_metrics(timeline, masks) -> dict[str, np.ndarray]` (ROI mean → full-timeline z-score → `gaussian_filter1d(σ=2)`); `summary(curves) -> dict[str, dict]` (peak/mean in z-units + percentile). Synthetic tests (random `timeline`, hand-made `masks`).
 - **T-D `plotting.py`** — `timeline_figure(t_axis: np.ndarray, curves: dict[str,np.ndarray], *, selected: list[str]) -> go.Figure`: stacked translucent Plotly traces on a shared 1 Hz axis, crosshair hover, click→seek hook (§6), styled per theme. **Pure function** of `(t_axis, curves)` — synthetic tests assert trace count == len(selected) and x-range == t_axis range.
 - **T-E `theme.py` + `ui.py`** — frontend-design "Cortical Observatory" tokens + CSS + 3-mode builders + states (empty/loading/error/result), `info=` tooltips, custom `<video>` HTML per §6.
@@ -227,7 +227,7 @@ Exact signatures (coders implement to these; all heavy calls behind the injected
 3. **`.start`-based x-axis realignment is unverified offline** (neuralset not installable here) → if absolute times don't match the media clock, the timeline x-axis is wrong. **Mitigation:** verify on first Space run (T-H step 4); deterministic §4 Fallback (`window_start + p`) eliminates the assumption entirely.
 4. **Llama gate pending Meta** → blocks the **text-feature path** of live inference only; the Space boots without it, and the `audio_only` path validates the full heavy pipeline (V-JEPA2 + DINOv2 + W2V-BERT) end-to-end now. `modality_dropout=0.3` means the model tolerates the missing text modality (degraded but valid).
 5. **"Virality" is a proxy / cortical-only / relative-only** → label as research proxy everywhere; state no-NAcc limitation; report **relative** (z-unit) values only; show underlying ROI.
-6. **Window seams from overlapping windows** → per-window z-score + Hann overlap-add + leading warm-up suppression + per-curve σ=2 s smoothing.
+6. **Window seams from overlapping windows** → per-window z-score + trapezoidal overlap-add + leading warm-up suppression + per-curve σ=2 s smoothing (all per §4).
 7. **ASR English-only** (`ExtractWordsFromAudio.language="english"`, hard-coded) → non-English audio yields wrong/empty transcripts and silently degrades the text path (no error). **Mitigation:** README + UI note; consider exposing language later (out of v1 scope).
 8. **`duration_trs` must stay 100** (pooler locked by ckpt, §3) → never expose/auto-tune it; changing it crashes `predict()`. Documented; no code path sets it.
 9. **ZeroGPU per-user quota** → quota banner + `concurrency=1`; Video heaviest, Text lightest.
@@ -235,25 +235,26 @@ Exact signatures (coders implement to these; all heavy calls behind the injected
 
 ---
 
-## 11. Decided defaults (coders build against these now; operator may override at go)
+## 11. Decisions (defaults locked; operator may override at GO)
 
-No open *high-level* questions remain — each prior question is resolved to a concrete default with rationale. Items marked *(operator may override at go)* are genuine preference calls that do not block implementation.
+No open *high-level* questions remain — every prior open question is resolved to a concrete default with rationale, so coders implement with **zero further high-level decisions**. Items marked *(operator may override at GO)* are genuine preference calls that do not block implementation.
 
-1. **Metric set — DECIDED.** Ship **Attention, Engagement/Arousal, Virality (proxy)** ON by default; **Language/semantic-load** and **Self-relevance/DMN** as toggles (default OFF). Exact Glasser parcels in §5. *Declined:* valence, memorability (no defensible cortical-ROI mapping — would over-claim). *(operator may override which curves are shown.)*
+1. **Metric set — DECIDED.** Ship **Attention, Engagement/Arousal, Virality (proxy)** ON by default; **Language/semantic-load** and **Self-relevance/DMN** as toggles (default OFF). Exact Glasser parcels in §5. *Declined:* valence, memorability (no defensible cortical-ROI mapping — would over-claim). *(operator may override which curves are shown at GO.)*
 2. **Window / hop — DECIDED & LOCKED (not a preference).** `win_s=100` is **forced** by the checkpoint pooler (§3); shorter windows are **unsupported** (crash `predict()`), not merely lower-fidelity. `hop_s=80` / `overlap_trs_train=20` per the HRF justification in §4. No speed-vs-fidelity dial exists here; speed comes from GPU-time tuning (§7), not window length.
 3. **Max input length — DECIDED.** Hard cap **300 s (5 min)**; reject longer with the friendly §6 error. Short clips work (≥ ~1 window; `<~10 s` shows an advisory note). *(operator may raise the cap; GPU-time grows ~linearly and re-validates against R1.)*
-4. **UI identity — DEFAULT.** "Cortical Observatory" (deep-slate + amber/cyan, §6). *(operator may override at go.)*
-5. **Space name — DEFAULT.** `techfreakworm/tribev2-brain-timeline`. *(operator may override at go.)*
+4. **UI identity — DEFAULT.** "Cortical Observatory" (deep-slate + amber/cyan, §6). *(operator may override at GO.)*
+5. **Space name — DEFAULT.** `techfreakworm/tribev2-brain-timeline`. *(operator may override at GO.)*
 6. **Interim validation before Llama — DECIDED.** Wire the `audio_only` path (skips ASR+Llama) as a debug toggle so the full heavy pipeline + windowing + metrics are validated on-Space *before* Meta approval (T-H step 2).
 
 ---
 
 ## 12. Sequence to first working milestone
 
-1. Operator reviews this plan (+ confirms or overrides the §11 decided defaults).
+1. Operator reviews this plan (+ confirms or overrides the §11 locked defaults).
 2. Coders execute T-A…T-G locally (synthetic-tested) — *independent of Llama gate*.
-3. Deploy skeleton → Space to the ONE Space; confirm UI boots + model object builds (no Llama needed yet).
-4. **On Meta approval:** run end-to-end on the Space, measure GPU-time, tune window/duration, validate the timeline across all 3 modes → first working milestone.
+3. Deploy skeleton → the ONE Space; confirm UI boots + model object builds (downloads ckpt only; no Llama needed yet).
+4. **Interim on-Space validation — BEFORE Meta approval (no Llama):** run the **`audio_only` path** (skips ASR + Llama) end-to-end on the Space for a 4–5 min clip. This exercises the *full heavy GPU pipeline* (V-JEPA2 + DINOv2 + W2V-BERT) plus **windowing → `stitch` → `to_metrics` → timeline**, and is where we **(a) confirm the ZeroGPU per-call duration allowance (R1), (b) measure GPU-seconds per 60 s of input and trim `@spaces.GPU(duration=…)`, (c) verify the `.start`-based x-axis matches the media clock** (else flip to the §4 `ffmpeg` fallback). De-risks everything except the text modality while Meta review is pending.
+5. **On Meta approval:** enable the full multimodal path; run end-to-end across all 3 modes (Video / Audio / Text), re-check GPU-time, final timeline validation → **first working milestone**.
 
 ---
 
@@ -267,14 +268,16 @@ Adversarial review by `brain` (max rigor + sequential-thinking) against tribev2 
 - **§6 — Added the `gr.Video`-has-no-seek risk with a decided fallback** (custom `<video>` + Plotly-click JS `currentTime`, or `#t=` media-fragment "Jump").
 - **§7 — Reconciled to approach B** (one `@spaces.GPU(duration=480)` per Run), made **R1 (ZeroGPU duration allowance)** explicit with the fallback ladder, and documented the **whisperx-via-`uvx` subprocess** (needs `uv` in the image + ~3 GB model download) and **MNE data** caching.
 - **§9 — Exact signatures** for every task (`load_model`, `run_inference` incl. the precise `audio_only` branch, `plan_windows`, `stitch`, `build_roi_masks`, `to_metrics`, `summary`, `timeline_figure`), with the duration-validation and startup-prewarm wired into T-F/T-H.
-- **§10 — Expanded risks** to 10, risk-ranked (R1 ZeroGPU allowance highest), adding whisperx/mne first-run cost, `.start` realignment unverified-offline, English-only ASR, `duration_trs` lock, and domain-shift.
-- **§11 — Converted all 5 open questions into decided defaults** (metric set; window/hop locked-not-preference; 300 s cap; UI identity; Space name) plus the `audio_only` interim-validation decision; preference-only items marked *(operator may override at go)*.
-- **§12 — Reworded** step 1 to "confirms or overrides defaults."
+- **§10 — Risk register (10 items, ranked):** R1 ZeroGPU duration allowance (#1); whisperx-via-`uvx` (needs `uv` + ~3 GB) and MNE/HCP-MMP (~1.5 GB) first-run downloads; `.start` x-axis unverified-offline; Llama-gate (text path only); proxy/cortical-only/relative-only; trapezoidal-stitch seam control; English-only ASR silent-degrade; `duration_trs` lock; per-user quota; domain-shift (UGC/music/animation). Term aligned to **trapezoidal** overlap-add (matches §4).
+- **§11 — All open questions removed → locked decisions** (metric set; window 100 s fixed-by-pooler / hop 80 s; 300 s cap; UI "Cortical Observatory"; Space name `techfreakworm/tribev2-brain-timeline`). Zero open high-level questions remain; preference-only items tagged *(operator may override at GO)*.
+- **§12 — Added the interim on-Space `audio_only` validation step** (step 4): real GPU validation of the heavy pipeline + windowing/stitch/metrics + duration-allowance + GPU-time measurement + x-axis check **before** Meta approval; full multimodal validation moved to step 5 (post-approval).
 
-**Residual risks (all have a concrete mitigation in-doc, none block local T-A…T-G):**
-1. **R1 — ZeroGPU per-call duration allowance** on techfreakworm's account (free tier ~120 s vs the 480 s approach-B may need). Verify first on-Space (T-H step 1); fallback ladder in §7.
-2. **`.start`-based x-axis** unverifiable offline (neuralset not installable). Verify T-H step 4; deterministic §4 fallback removes the assumption.
-3. **whisperx/`uvx` + MNE `sample`** heavy first run / image deps. Mitigated by `uv`+`mne` in image, caching, `audio_only` interim.
+**Residual risks (all have a concrete mitigation in-doc; none block local T-A…T-G):**
+1. **R1 — ZeroGPU per-call duration allowance** on techfreakworm's account (free tier ~120 s vs the ~480 s approach-B may need). Verify first on-Space (§12 step 4 / §9 T-H); fallback ladder in §7.
+2. **`.start`-based x-axis** unverifiable offline (neuralset not installable). Verify §12 step 4; deterministic §4 `ffmpeg` fallback removes the assumption.
+3. **whisperx/`uvx` + MNE `sample`** heavy first run / image deps. Mitigated by `uv`+`mne` in the image (§9 T-G — the authoritative requirements list; the §8 layout box is an illustrative snapshot), caching to `CACHE_DIR`, `.npz` pre-warm, and the `audio_only` interim path.
 4. **Validity** of the metric proxies (relative-only, cortical-only) — an inherent model limitation, surfaced honestly in UI/README, not a build blocker.
 
-BRAIN SIGN-OFF v1: docs/PLAN.md is gap-free and implementation-ready.
+**Verification:** re-read the whole file end-to-end; §0–§9 left as-is (lead-merged) and confirmed internally consistent with §10–§13; all cross-references resolve; no placeholders, TODOs, or undecided high-level choices remain. A coder can implement T-A…T-H to the exact signatures in §9 with no further high-level decisions.
+
+BRAIN SIGN-OFF v2: docs/PLAN.md is gap-free and implementation-ready.

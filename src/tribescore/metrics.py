@@ -1,45 +1,427 @@
 """Reduce a brain-activity timeline to named "brain-metric" curves.
 
 TRIBE v2 predicts fMRI-like activity over the cortical surface: a tensor of
-shape ``(T, n_vertices)`` where each vertex is a location on a standard mesh
-(``fsaverage5``). This module collapses that high-dimensional signal into a
-handful of interpretable curves over time -- our derived "brain metrics":
+shape ``(T, 20484)`` where ``20484 = 2 x 10242`` ``fsaverage5`` vertices
+(left hemisphere ``[0:10242]`` then right ``[10242:20484]``). This module
+collapses that high-dimensional signal into a handful of interpretable curves
+over time -- our derived "brain metrics".
 
-    * **attention**  -- engagement of fronto-parietal / dorsal-attention
-      regions and primary sensory cortex.
-    * **virality**   -- a heuristic combining reward/affective salience with
-      the breadth of cortical co-activation (how "shareable" a moment looks).
-    * **engagement** -- overall cortical involvement (global activity), a
-      catch-all for how much the brain is "doing".
+This is the implementation of task **T-C** in ``docs/PLAN.md`` (see §5 for the
+atlas, the exact Glasser parcel lists, the normalization + smoothing recipe,
+and the honesty caveats; see §9 T-C for the exact signatures).
 
-IMPORTANT: these are DERIVED, heuristic interpretations, not validated
-neuroscientific or commercial measurements. The mapping from anatomical ROIs
-to product-flavoured metric names is an editorial choice of this demo; see
-README.md and NOTICE.
+Atlas
+-----
+We use **HCP-MMP1 (Glasser 2016)** via tribev2's own shipped helper
+(:mod:`tribev2.utils`), *not* nilearn Yeo/Schaefer. ``get_hcp_roi_indices``
+returns vertex indices **already in the 20484 output index space** (the right
+hemisphere ``+10242`` offset is applied for us), strips the ``L_``/``R_``
+prefix and ``_ROI`` suffix (so keys are bare Glasser names like ``FEF``,
+``LIPv``, ``TPOJ1``, ``p32``, ``10r``), pools both hemispheres under one key,
+and supports ``*`` wildcards. This guarantees index agreement with ``preds``
+and removes the entire nilearn atlas-fetch + manual vertex-alignment surface.
 
-The ROI grouping is provided by an atlas that labels each vertex with a
-region. In production we resolve a parcellation onto ``fsaverage5`` (e.g. via
-``nilearn``); here we keep the math model-free and atlas-injectable so it is
-unit-testable with synthetic labels.
+Honesty caveat (§5): "Virality" is a **research proxy** from cortical value-
+region activity, not a guarantee of going viral. ``facebook/tribev2`` is
+cortical-only (no ventral striatum / NAcc -- the strongest neuroforecasting
+node), so the vmPFC/mPFC signal is the validated *complement*, not a
+substitute. Because the training target was per-sample z-scored + detrended,
+**only relative temporal dynamics are interpretable -- absolute "scores" are
+meaningless.** Summaries therefore report *relative* peaks (z-units /
+percentile).
 
-Nothing in this module imports torch or tribev2.
+Local-import safety
+-------------------
+Importing this module never touches ``tribev2``/``torch``/``mne``: the only
+function that needs them is :func:`build_roi_masks`, whose import of
+``tribev2.utils`` is guarded and deferred. ``to_metrics`` / :func:`summary`
+are pure numpy + scipy and fully unit-testable locally. The legacy
+synthetic-atlas API (:class:`Atlas`, :func:`reduce_to_metrics`, ...) is kept
+for backward compatibility with the package re-exports and existing callers.
 """
 
 from __future__ import annotations
 
+import logging
+import os
 from dataclasses import dataclass, field
 from typing import Dict, Mapping, Sequence
 
 import numpy as np
+from scipy.ndimage import gaussian_filter1d
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Metric definitions
+# T-C : metric -> Glasser (HCP-MMP1) parcels  (docs/PLAN.md §5)
 # ---------------------------------------------------------------------------
+#
+# Bare ``combine=False`` Glasser names (no ``L_``/``R_`` prefix, no ``_ROI``
+# suffix) -- exactly as returned by ``tribev2.utils.get_hcp_labels(...,
+# combine=False)`` and consumed by ``get_hcp_roi_indices``. The metric value
+# per TR is the mean activity over the *union* of these parcels' vertices
+# across both hemispheres.
+#
+# These lists are transcribed verbatim from the §5 tables. Do NOT silently
+# "fix" a name here -- ``build_roi_masks`` validates every key against the live
+# atlas and logs + drops any that the installed ``mne`` version does not know,
+# so naming drift surfaces loudly rather than corrupting the masks.
+
+PARCELS: Dict[str, list[str]] = {
+    # --- default ON ---------------------------------------------------------
+    # Dorsal attention (FEF + IPS complex) + Ventral attention
+    # (TPOJ / PGi / PGs / PFm + IFJ) + Frontoparietal control (DLPFC).
+    "Attention": [
+        "FEF", "LIPv", "LIPd", "VIP", "MIP", "AIP", "IP0", "IP1", "IP2",
+        "TPOJ1", "TPOJ2", "PGi", "PGs", "PFm",
+        "IFJa", "IFJp",
+        "p9-46v", "a9-46v", "9-46d", "46", "8C", "i6-8", "s6-8",
+    ],
+    # Sensory drive (early visual + motion + early/assoc. auditory) +
+    # associative integration (STS).
+    "Engagement": [
+        "V1", "V2", "V3", "V4", "V3A", "V3B", "V6", "V6A", "MT", "MST",
+        "A1", "LBelt", "MBelt", "PBelt", "A4", "A5",
+        "STSdp", "STSvp", "STSda", "STSva", "TE1p", "TE2p",
+    ],
+    # vmPFC / mOFC / pgACC / mPFC cortical *value* signal (virality proxy).
+    "Virality": [
+        "10r", "10v", "10d", "10pp", "p32", "s32", "a24", "d32", "25",
+        "OFC", "pOFC", "11l", "13l", "9m",
+    ],
+    # --- default OFF (toggleable) -------------------------------------------
+    # Core language network (text + audio driven).
+    "Language": [
+        "44", "45", "IFSa", "STSdp", "STSvp", "STGa", "TE1a", "A5",
+        "PSL", "SFL", "55b",
+    ],
+    # Default-mode / self & social relevance -- a secondary sharing cue.
+    "Self-relevance": [
+        "7m", "POS2", "v23ab", "d23ab", "31pv", "31pd", "RSC", "PCV",
+        "9m", "10r", "PGs", "PGi",
+    ],
+}
+
+#: Metrics shown ON by default in the UI (§5 / §11.1). The remaining keys of
+#: :data:`PARCELS` ("Language", "Self-relevance") are toggleable, default OFF.
+METRIC_DEFAULT_ON: frozenset[str] = frozenset({"Attention", "Engagement", "Virality"})
+
+#: Filename of the persisted ROI-mask cache (§5 / §7). Keyed by atlas + mesh so
+#: a future mesh change cannot silently load stale indices.
+ROI_MASKS_FILENAME = "roi_masks_hcpmmp1_fsaverage5.npz"
+
+#: z-score floor (§5): ``(x - mean) / (std + EPS)`` -- guards against a flat
+#: (zero-variance) curve producing NaNs/inf.
+_EPS = 1e-6
+
+#: Gaussian temporal smoothing width in seconds (§5). TR = 1 s so sigma is in
+#: samples too. ``truncate=3`` -> ~13-tap kernel; matches BOLD sluggishness
+#: while preserving peaks for click-to-seek (§6).
+_SMOOTH_SIGMA_S = 2.0
+_SMOOTH_TRUNCATE = 3.0
+
+
+# ---------------------------------------------------------------------------
+# T-C : build_roi_masks  (docs/PLAN.md §5, §9 T-C)
+# ---------------------------------------------------------------------------
+
+
+def build_roi_masks(cache_dir: str, mesh: str = "fsaverage5") -> Dict[str, np.ndarray]:
+    """Build (or load) per-metric vertex-index masks over the cortical mesh.
+
+    For every metric in :data:`PARCELS`, gather the vertex indices of its
+    Glasser parcels in the **20484 output index space** and de-duplicate them::
+
+        valid = set(get_hcp_labels(mesh=mesh, combine=False, hemi="both"))
+        mask[metric] = np.unique(np.concatenate([
+            get_hcp_roi_indices(p, hemi="both", mesh=mesh)
+            for p in PARCELS[metric] if p in valid
+        ]))
+
+    Any parcel name not present in the live atlas (naming can vary by ``mne``
+    version) is dropped *and logged* -- we never silently substitute wrong
+    indices. The result is **static** (input-independent), so it is persisted
+    to ``cache_dir/roi_masks_hcpmmp1_fsaverage5.npz`` and reloaded thereafter.
+
+    This is the only function in the module that needs ``tribev2`` (and,
+    transitively, ``mne`` + a one-time ~1.5 GB atlas download -- §5/§7). The
+    import is **guarded and deferred**: importing :mod:`tribescore.metrics`
+    works without ``tribev2`` installed; only *calling* this function off the
+    Space without the dependency raises.
+
+    Parameters
+    ----------
+    cache_dir:
+        Directory for the persisted ``.npz`` mask cache. Created if missing.
+    mesh:
+        Surface mesh name. Must be ``"fsaverage5"`` -- the checkpoint's output
+        space (§3). Exposed only so the cache key and atlas calls stay in sync.
+
+    Returns
+    -------
+    dict
+        ``{metric_name: np.ndarray}`` -- a sorted, unique 1-D int array of
+        vertex indices per metric, ready to index columns of a
+        ``(T, 20484)`` timeline.
+
+    Raises
+    ------
+    RuntimeError
+        If ``tribev2`` (or its atlas backend) is unavailable when a fresh
+        build is required -- i.e. called off-Space without the dependency and
+        no cache present. The message points at the gate in §0/§5.
+    ValueError
+        If, after validation, a metric has zero usable parcels (atlas
+        mismatch severe enough that the masks would be meaningless).
+    """
+    cache_path = os.path.join(cache_dir, ROI_MASKS_FILENAME)
+
+    # --- fast path: load from the persisted cache --------------------------
+    cached = _load_roi_masks(cache_path)
+    if cached is not None:
+        return cached
+
+    # --- slow path: build from the live atlas (needs tribev2 + mne) --------
+    try:  # guarded, deferred import -- keeps this module import-safe locally
+        from tribev2.utils import get_hcp_labels, get_hcp_roi_indices
+    except Exception as exc:  # ImportError or a backend (mne) import failure
+        raise RuntimeError(
+            "build_roi_masks needs `tribev2` (which pulls in `mne` + the "
+            "HCP-MMP1 atlas) to compute ROI vertex indices. Per docs/PLAN.md "
+            "§0/§5 this runs on the HF Space, not locally. No mask cache was "
+            f"found at {cache_path!r} either, so the masks cannot be built "
+            f"here. Original error: {exc!r}"
+        ) from exc
+
+    # The live set of valid bare Glasser names for this mesh (§5 startup guard).
+    valid = set(get_hcp_labels(mesh=mesh, combine=False, hemi="both").keys())
+
+    masks: Dict[str, np.ndarray] = {}
+    for metric, parcels in PARCELS.items():
+        present = [p for p in parcels if p in valid]
+        missing = [p for p in parcels if p not in valid]
+        if missing:
+            logger.warning(
+                "build_roi_masks[%s]: %d/%d parcels not in the %s HCP-MMP1 "
+                "atlas, dropping them: %s",
+                metric, len(missing), len(parcels), mesh, missing,
+            )
+        if not present:
+            raise ValueError(
+                f"metric {metric!r} has no valid Glasser parcels against the "
+                f"{mesh} HCP-MMP1 atlas (wanted {parcels}); cannot build a "
+                "mask. Check the installed `mne` atlas naming."
+            )
+        idx = np.unique(
+            np.concatenate(
+                [
+                    np.asarray(get_hcp_roi_indices(p, hemi="both", mesh=mesh))
+                    for p in present
+                ]
+            )
+        ).astype(np.int64)
+        masks[metric] = idx
+        logger.info(
+            "build_roi_masks[%s]: %d parcels -> %d unique vertices",
+            metric, len(present), idx.size,
+        )
+
+    _save_roi_masks(cache_path, masks)
+    return masks
+
+
+def _load_roi_masks(cache_path: str) -> Dict[str, np.ndarray] | None:
+    """Load persisted masks from ``cache_path``; return ``None`` if absent.
+
+    A corrupt/unreadable cache is treated as a miss (logged) rather than a
+    hard error, so a bad file self-heals on the next build.
+    """
+    if not os.path.exists(cache_path):
+        return None
+    try:
+        with np.load(cache_path, allow_pickle=False) as npz:
+            masks = {k: np.asarray(npz[k], dtype=np.int64) for k in npz.files}
+        if not masks:
+            return None
+        logger.info("build_roi_masks: loaded %d masks from %s", len(masks), cache_path)
+        return masks
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(
+            "build_roi_masks: could not read mask cache %s (%r); rebuilding.",
+            cache_path, exc,
+        )
+        return None
+
+
+def _save_roi_masks(cache_path: str, masks: Mapping[str, np.ndarray]) -> None:
+    """Persist masks to ``cache_path`` as a ``.npz`` (best effort)."""
+    os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+    try:
+        np.savez(cache_path, **{k: np.asarray(v) for k, v in masks.items()})
+        logger.info("build_roi_masks: cached %d masks to %s", len(masks), cache_path)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(
+            "build_roi_masks: could not write mask cache %s (%r); continuing "
+            "without persistence.",
+            cache_path, exc,
+        )
+
+
+# ---------------------------------------------------------------------------
+# T-C : to_metrics  (docs/PLAN.md §5, §9 T-C)
+# ---------------------------------------------------------------------------
+
+
+def to_metrics(
+    timeline: np.ndarray,
+    masks: Mapping[str, np.ndarray],
+) -> Dict[str, np.ndarray]:
+    """Reduce a ``(T, 20484)`` activity timeline to named metric curves.
+
+    For each metric mask, the pipeline (§5) is, per TR:
+
+    1. **ROI mean** -- average activity over that metric's vertices ->
+       ``raw`` of shape ``(T,)``.
+    2. **Full-timeline z-score** -- ``(raw - raw.mean()) / (raw.std() + 1e-6)``
+       (the canonical, plotted series; absolute level is not meaningful).
+    3. **Gaussian temporal smoothing** -- ``gaussian_filter1d`` with
+       ``sigma = 2`` s (TR = 1 s), ``truncate = 3`` (~13-tap), matching BOLD
+       sluggishness while preserving peaks for click-to-seek.
+
+    Pure numpy + scipy -- no model, fully unit-testable.
+
+    Parameters
+    ----------
+    timeline:
+        Activity of shape ``(T, 20484)`` (the stitched, per-window-z-scored
+        output of :func:`tribescore.windowing.stitch`). Columns are
+        ``fsaverage5`` vertices in the order the model emits them.
+    masks:
+        ``{metric_name: vertex_indices}`` from :func:`build_roi_masks` (or, in
+        tests, hand-made index arrays).
+
+    Returns
+    -------
+    dict
+        ``{metric_name: curve}`` with one z-scored, smoothed ``(T,)`` curve
+        per mask, in the same order as ``masks``.
+
+    Raises
+    ------
+    ValueError
+        If ``timeline`` is not 2-D, or a mask references a vertex index
+        outside ``[0, n_vertices)``.
+    """
+    timeline = np.asarray(timeline, dtype=float)
+    if timeline.ndim != 2:
+        raise ValueError(f"timeline must be 2-D (T, V), got {timeline.shape}")
+    n_t, n_v = timeline.shape
+
+    out: Dict[str, np.ndarray] = {}
+    for name, idx in masks.items():
+        idx = np.asarray(idx)
+        if idx.size == 0:
+            raise ValueError(f"mask {name!r} is empty")
+        if idx.min() < 0 or idx.max() >= n_v:
+            raise ValueError(
+                f"mask {name!r} indexes vertices outside [0, {n_v}) "
+                f"(min={int(idx.min())}, max={int(idx.max())})"
+            )
+        raw = timeline[:, idx].mean(axis=1)               # (T,) ROI mean
+        z = _zscore(raw)                                   # full-timeline z
+        out[name] = _smooth(z, n_t)                        # Gaussian sigma=2 s
+    return out
+
+
+def _zscore(x: np.ndarray) -> np.ndarray:
+    """Full-series z-score with the §5 floor: ``(x - mean) / (std + 1e-6)``."""
+    x = np.asarray(x, dtype=float)
+    return (x - x.mean()) / (x.std() + _EPS)
+
+
+def _smooth(x: np.ndarray, n_t: int) -> np.ndarray:
+    """Gaussian temporal smoothing (sigma=2 s, truncate=3); length-preserving.
+
+    Degenerate short series (``T < 2``) are returned unchanged -- there is
+    nothing to smooth and ``gaussian_filter1d`` on a single sample is a no-op.
+    """
+    if n_t < 2:
+        return x
+    return gaussian_filter1d(
+        x, sigma=_SMOOTH_SIGMA_S, truncate=_SMOOTH_TRUNCATE, mode="nearest"
+    )
+
+
+# ---------------------------------------------------------------------------
+# T-C : summary  (docs/PLAN.md §5, §9 T-C)
+# ---------------------------------------------------------------------------
+
+
+def summary(curves: Mapping[str, np.ndarray]) -> Dict[str, dict]:
+    """Per-metric headline statistics for the summary strip (§5/§6).
+
+    Everything is reported in **relative** terms only (z-units / percentile)
+    -- absolute "scores" are meaningless for this model (§5 caveat).
+
+    Parameters
+    ----------
+    curves:
+        ``{metric_name: curve}`` as returned by :func:`to_metrics` -- each a
+        z-scored, smoothed ``(T,)`` array.
+
+    Returns
+    -------
+    dict
+        ``{metric_name: stats}`` where ``stats`` has:
+
+        * ``peak``           -- max value, in z-units.
+        * ``mean``           -- mean value, in z-units (~0 for a z-scored
+          curve; nonzero after smoothing/asymmetry).
+        * ``peak_time``      -- integer TR index (= second, TR = 1 s) of the
+          peak; ``-1`` for an empty curve.
+        * ``peak_percentile``-- the peak's percentile rank within its own
+          curve (100.0 for a strict global max).
+    """
+    out: Dict[str, dict] = {}
+    for name, curve in curves.items():
+        curve = np.asarray(curve, dtype=float)
+        if curve.size == 0:
+            out[name] = {
+                "peak": float("nan"),
+                "mean": float("nan"),
+                "peak_time": -1,
+                "peak_percentile": float("nan"),
+            }
+            continue
+        peak_idx = int(np.argmax(curve))
+        peak_val = float(curve[peak_idx])
+        # Percentile rank of the peak within the curve (fraction <= peak).
+        peak_pct = float((curve <= peak_val).mean() * 100.0)
+        out[name] = {
+            "peak": peak_val,
+            "mean": float(curve.mean()),
+            "peak_time": peak_idx,
+            "peak_percentile": peak_pct,
+        }
+    return out
+
+
+# ===========================================================================
+# Legacy synthetic-atlas API (backward compatibility)
+# ===========================================================================
+#
+# The package re-exports ``DEFAULT_METRICS`` and ``reduce_to_metrics`` from
+# :mod:`tribescore` (see ``tribescore/__init__.py``), and earlier code/tests
+# built curves from an injectable :class:`Atlas`. That surface is kept intact
+# and unchanged below so nothing that imports it breaks. New code should use
+# the T-C API above (:data:`PARCELS`, :func:`build_roi_masks`,
+# :func:`to_metrics`, :func:`summary`), which is the real, Glasser-grounded
+# pipeline from docs/PLAN.md §5.
 
 
 @dataclass(frozen=True)
 class MetricSpec:
-    """Definition of one derived metric.
+    """Definition of one *legacy* synthetic-atlas metric.
 
     Attributes
     ----------
@@ -47,10 +429,9 @@ class MetricSpec:
         Display name of the metric (e.g. ``"attention"``).
     roi_weights:
         Mapping from ROI label -> signed weight. The metric at each time
-        point is the weighted average of those ROIs' mean activity. Positive
-        weights add, negative weights subtract (e.g. suppressed regions).
+        point is the weighted average of those ROIs' mean activity.
     description:
-        Short human-readable rationale, surfaced in the UI/tooltip.
+        Short human-readable rationale.
     """
 
     name: str
@@ -58,12 +439,9 @@ class MetricSpec:
     description: str = ""
 
 
-#: The default metric suite. ROI *names* here are placeholders for a real
-#: parcellation's region labels; the production atlas loader
-#: (:func:`load_fsaverage5_atlas`) must map vertices to compatible labels.
-#:
-#: TODO: replace these illustrative ROI groupings with a concrete, cited
-#: parcellation (e.g. Yeo-7/17 networks or Schaefer-400) and tune weights.
+#: Legacy illustrative metric suite (synthetic ROI *names*, not Glasser
+#: parcels). Retained only for backward compatibility / existing re-exports;
+#: the canonical, cited mapping is :data:`PARCELS`.
 DEFAULT_METRICS: tuple[MetricSpec, ...] = (
     MetricSpec(
         name="attention",
@@ -106,14 +484,9 @@ DEFAULT_METRICS: tuple[MetricSpec, ...] = (
 )
 
 
-# ---------------------------------------------------------------------------
-# Atlas
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class Atlas:
-    """Vertex -> ROI assignment for a fixed mesh.
+    """Vertex -> ROI assignment for a fixed mesh (legacy synthetic API).
 
     Attributes
     ----------
@@ -137,35 +510,24 @@ class Atlas:
 
 
 def load_fsaverage5_atlas() -> Atlas:
-    """Load a parcellation mapped onto the ``fsaverage5`` surface.
+    """Legacy hook (deferred). Use :func:`build_roi_masks` instead.
 
-    Production helper: fetch a parcellation (e.g. Yeo networks or Schaefer)
-    via ``nilearn`` and project it to per-vertex labels matching the order of
-    the TRIBE v2 prediction columns.
-
-    Returns
-    -------
-    Atlas
-        Per-vertex ROI labels for ``fsaverage5``.
-
-    Notes
-    -----
-    Deferred (TODO). This is the only place an atlas resource is fetched, and
-    it is called lazily so importing this module stays dependency-free.
+    Raises
+    ------
+    NotImplementedError
+        Always -- the real ROI grounding is now :func:`build_roi_masks`
+        (HCP-MMP1 / Glasser via ``tribev2.utils``). For tests, construct an
+        :class:`Atlas` with synthetic labels directly.
     """
     raise NotImplementedError(
-        "fsaverage5 atlas loading is implemented on the Space (nilearn). "
-        "For tests, construct an Atlas with synthetic labels directly."
+        "Synthetic fsaverage5 atlas loading is superseded by build_roi_masks "
+        "(HCP-MMP1 / Glasser). For tests, construct an Atlas with synthetic "
+        "labels directly."
     )
 
 
-# ---------------------------------------------------------------------------
-# Reduction
-# ---------------------------------------------------------------------------
-
-
 def roi_means(timeline: np.ndarray, atlas: Atlas) -> Dict[str, np.ndarray]:
-    """Average activity within each ROI at every time point.
+    """Average activity within each ROI at every time point (legacy API).
 
     Parameters
     ----------
@@ -211,24 +573,22 @@ def reduce_to_metrics(
     smooth_window: int = 1,
     rescale_0_1: bool = True,
 ) -> Dict[str, np.ndarray]:
-    """Collapse a ``(T, n_vertices)`` timeline into named metric curves.
+    """Collapse a ``(T, n_vertices)`` timeline into named curves (legacy API).
 
     For each :class:`MetricSpec`, take the weighted combination of its ROIs'
     mean activity, optionally smooth it over time, and optionally rescale to
-    ``[0, 1]`` for display.
+    ``[0, 1]`` for display. Superseded by :func:`to_metrics` for production.
 
     Parameters
     ----------
     timeline:
-        Activity of shape ``(T, n_vertices)`` (typically already z-scored by
-        :func:`tribescore.windowing.run_windowed`).
+        Activity of shape ``(T, n_vertices)``.
     atlas:
         Vertex-to-ROI assignment.
     metrics:
         Metric specifications to compute. Defaults to :data:`DEFAULT_METRICS`.
     smooth_window:
-        Moving-average window length (in TRs/samples) applied to each curve.
-        ``1`` disables smoothing.
+        Moving-average window length (in TRs/samples). ``1`` disables smoothing.
     rescale_0_1:
         If ``True``, min-max rescale each curve to ``[0, 1]`` for plotting.
 
@@ -236,13 +596,6 @@ def reduce_to_metrics(
     -------
     dict
         ``{metric_name: curve}`` where each ``curve`` has shape ``(T,)``.
-
-    Notes
-    -----
-    The numerics here are intentionally simple and fully implemented so the
-    reduction is unit-testable end to end with a synthetic atlas. The
-    editorial ROI groupings in :data:`DEFAULT_METRICS` are the placeholder
-    part (TODO: replace with a cited parcellation).
     """
     per_roi = roi_means(timeline, atlas)
     n_t = timeline.shape[0]
@@ -265,13 +618,8 @@ def reduce_to_metrics(
     return out
 
 
-# ---------------------------------------------------------------------------
-# Small numeric helpers
-# ---------------------------------------------------------------------------
-
-
 def _moving_average(x: np.ndarray, window: int) -> np.ndarray:
-    """Centered moving average with edge-padding to preserve length."""
+    """Centered moving average with edge-padding to preserve length (legacy)."""
     if window <= 1 or x.size == 0:
         return x
     window = min(window, x.size)
@@ -283,7 +631,7 @@ def _moving_average(x: np.ndarray, window: int) -> np.ndarray:
 
 
 def _minmax(x: np.ndarray) -> np.ndarray:
-    """Rescale to ``[0, 1]``; flat signals map to all-zeros."""
+    """Rescale to ``[0, 1]``; flat signals map to all-zeros (legacy)."""
     lo, hi = float(np.min(x)), float(np.max(x))
     if hi - lo <= 1e-12:
         return np.zeros_like(x)

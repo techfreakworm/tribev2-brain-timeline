@@ -1,169 +1,377 @@
-"""Gradio entrypoint for the TRIBE v2 Video Brain-Score Space.
+"""Gradio entrypoint — TRIBE v2 Video Brain-Score (Cortical Observatory).
 
-Score a 4-5 minute video with ``facebook/tribev2`` and plot derived
-brain-metric curves (attention, virality, engagement) over the full timeline.
+Score a video / audio / text input with ``facebook/tribev2`` and plot derived
+brain-metric curves (attention, engagement, virality, …) over the full
+timeline. Three input modes (PLAN.md §2) all feed the same pipeline:
 
-IMPORTANT -- import safety
---------------------------
-This module must ``import`` cleanly on a CPU-only machine WITHOUT ``torch``,
-``tribev2``, or ``spaces`` installed (CI runs ``ast.parse`` / a plain import
-as a smoke test). Therefore:
+    input -> get_events_dataframe -> @spaces.GPU predict (approach B, §4)
+          -> windowing.stitch -> metrics.to_metrics -> plotting.timeline_figure
 
-  * The model is NEVER loaded at import time. It is loaded lazily, once, the
-    first time inference runs -- and only inside the Space (guarded by
-    :func:`tribescore.inference.on_spaces`).
-  * ``spaces`` is imported behind a try/except with a no-op ``GPU`` fallback,
-    so the decorator is always defined even when the package is absent.
-  * Heavy work lives in :mod:`tribescore`; this file is just UI + wiring.
-
-Model execution runs on the Hugging Face ZeroGPU Space. See README.md.
+Import safety: the heavy stack (torch / tribev2 / mne) is touched only on the
+Space, inside lazily-imported functions. ``gradio`` / ``theme`` / ``ui`` /
+``plotly`` are required to import this module (it is the Gradio app), so it is
+validated by ``ast.parse`` locally and run for real only on the Space.
 """
 
 from __future__ import annotations
 
+import logging
 import os
+import tempfile
+from pathlib import Path
 
 import gradio as gr
 
+import theme
+import ui
 from tribescore import __version__
-from tribescore.inference import DEFAULT_MODEL_ID, on_spaces
+from tribescore.inference import (
+    DEFAULT_MESH,
+    DEFAULT_MODEL_ID,
+    load_model,
+    on_spaces,
+    run_inference,
+)
+from tribescore.metrics import build_roi_masks, summary, to_metrics
+from tribescore.plotting import seek_js, timeline_figure
+from tribescore.windowing import stitch
+
+logger = logging.getLogger("tribescore.app")
+logging.basicConfig(level=logging.INFO)
 
 # whisperx (pulled in by tribev2) runs through an old huggingface_hub; disable
-# hf_transfer to match the proven reference Space.
+# hf_transfer to match the proven reference Space (cbensimon/tribe-v2-demo).
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
 
-# ZeroGPU budget (seconds) for one full-video scoring call. The reference
-# demo uses 480s (8 min); a 4-5 min video plus feature extraction fits there.
-GPU_DURATION_S = 480
-
-# Demo input: a short, freely-licensed clip so the Space works out of the box.
-DEFAULT_VIDEO_URL = (
+# --- constants --------------------------------------------------------------
+GPU_DURATION_S = 480          # ZeroGPU reservation per Run (§7; reference uses 480)
+MAX_DURATION_S = 300          # 5 min hard cap (§11.3)
+MIN_USEFUL_S = 10             # advisory: clips shorter than this are degenerate
+MAX_TEXT_CHARS = 5000         # cap TTS length so text mode can't blow GPU time
+SAMPLE_VIDEO_URL = (
     "https://download.blender.org/durian/trailer/sintel_trailer-480p.mp4"
 )
 
+# UI metric display name  <->  metrics.PARCELS key (the two sides differ).
+NAME_TO_KEY = {
+    "Attention": "Attention",
+    "Engagement / arousal": "Engagement",
+    "Virality (proxy)": "Virality",
+    "Language / semantic load": "Language",
+    "Self-relevance / DMN": "Self-relevance",
+}
+KEY_TO_NAME = {v: k for k, v in NAME_TO_KEY.items()}
 
-# ---------------------------------------------------------------------------
-# spaces.GPU shim: real decorator on the Space, transparent no-op elsewhere so
-# this file imports without the `spaces` package present.
-# ---------------------------------------------------------------------------
+
+# --- cache dir (persistent /data if available, else ./cache; §7) ------------
+def _resolve_cache_dir() -> str:
+    for cand in ("/data", os.path.join(os.getcwd(), "cache")):
+        try:
+            os.makedirs(cand, exist_ok=True)
+            if os.access(cand, os.W_OK):
+                return cand
+        except Exception:
+            continue
+    return tempfile.mkdtemp(prefix="tribescore-")
+
+
+CACHE_DIR = _resolve_cache_dir()
+# Point MNE's data dir at the cache so the HCP-MMP atlas download is reused.
+os.environ.setdefault("MNE_DATA", os.path.join(CACHE_DIR, "mne_data"))
+
+
+# --- spaces.GPU shim: real decorator on the Space, no-op locally ------------
 try:  # pragma: no cover - exercised only where `spaces` is installed
     import spaces
 
     gpu = spaces.GPU(duration=GPU_DURATION_S)
-except Exception:  # ModuleNotFoundError locally, or any spaces init failure
+except Exception:
 
     def gpu(fn):  # type: ignore[misc]
-        """No-op stand-in for ``spaces.GPU`` when the package is unavailable."""
         return fn
 
 
-# ---------------------------------------------------------------------------
-# Lazy, singleton model handle. Populated on first use, on the Space only.
-# ---------------------------------------------------------------------------
-_MODEL = None
+# --- lazy singletons --------------------------------------------------------
+_MASKS = None
 
 
-def _get_model():
-    """Load the TRIBE v2 model once, lazily, guarded to the Space runtime.
-
-    Never called at import time. Raises a clear error if invoked off-Space or
-    without the heavy stack, so a local run fails loudly instead of silently
-    attempting a multi-GB download.
-    """
-    global _MODEL
-    if _MODEL is None:
-        if not on_spaces():
-            raise RuntimeError(
-                "Model loading is only supported on the Hugging Face ZeroGPU "
-                "Space. Run this app there; locally it stays a UI shell."
-            )
-        # Deferred import: heavy stack touched only here, only on the Space.
-        from tribescore.inference import load_model
-
-        _MODEL = load_model(DEFAULT_MODEL_ID)
-    return _MODEL
+def _get_masks():
+    """ROI masks (HCP-MMP1), built once and cached (§5). CPU; needs tribev2+mne."""
+    global _MASKS
+    if _MASKS is None:
+        _MASKS = build_roi_masks(CACHE_DIR, mesh=DEFAULT_MESH)
+    return _MASKS
 
 
-# ---------------------------------------------------------------------------
-# Inference callback (UI -> windowed prediction -> metric curves -> figure).
-# ---------------------------------------------------------------------------
+# Eager model load at startup on the Space so the `spaces` runtime registers the
+# CUDA allocations during the supported startup phase (§7; mirrors cbensimon /
+# qwen). Building the model only downloads the 708 MB ckpt — backbones load
+# lazily inside predict() — so this is safe even if a backbone gate were closed.
+if on_spaces():
+    try:
+        load_model(CACHE_DIR)
+        logger.info("eager model load complete at startup")
+    except Exception as exc:  # non-fatal: first Run retries + surfaces the error
+        logger.warning("eager model load failed (will retry on first run): %r", exc)
+
+
+# --- GPU-timed inference (only the model forward is on the GPU clock) --------
 @gpu
-def score_video(video_url: str):
-    """Score a video and return a brain-metric timeline figure.
+def _gpu_infer(mode: str, src_path: str, audio_only: bool):
+    """Run one whole-clip predict() on ZeroGPU. Everything else is CPU."""
+    model = load_model(CACHE_DIR)  # singleton: instant after eager startup load
+    return run_inference(model, mode, src_path, audio_only=audio_only)
 
-    End-to-end flow (assembled from the :mod:`tribescore` building blocks):
 
-        1. download the clip                       (inference helpers)
-        2. build the events DataFrame              (inference.build_events)
-        3. windowed prediction over the timeline   (windowing.run_windowed,
-           with ``infer_fn = partial(predict_window, model, events)``)
-        4. ROI reduction to metric curves          (metrics.reduce_to_metrics)
-        5. render the timeline figure              (plotting.plot_metric_timeline)
+# --- helpers ----------------------------------------------------------------
+def _probe_duration_s(path: str) -> float | None:
+    """Media duration in seconds via ffprobe; ``None`` if it can't be read."""
+    import subprocess
 
-    Returns
-    -------
-    plotly.graph_objects.Figure
-        The metric-vs-time plot for ``gr.Plot``.
+    try:
+        out = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=nw=1:nk=1", str(path),
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        return float(out.stdout.strip())
+    except Exception:
+        return None
 
-    Notes
-    -----
-    Body is deferred (TODO). It is intentionally thin -- it only orchestrates
-    already-specified functions. Kept minimal here so this module imports
-    without the model present.
+
+def _text_to_tmp(text: str) -> str:
+    """Write text-mode input to a temp ``.txt`` for get_events_dataframe."""
+    fd, path = tempfile.mkstemp(suffix=".txt", dir=CACHE_DIR)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    return path
+
+
+def _media_html(mode: str, src_path: str) -> str:
+    """Custom ``id='tm-video'`` media element the timeline click seeks (§6).
+
+    Uses Gradio's file route to serve the uploaded file. Best-effort: if the
+    route differs, the timeline + metrics still render; only seek is affected.
     """
-    raise NotImplementedError(
-        "score_video is wired up on the Space. The building blocks live in "
-        "tribescore.{inference,windowing,metrics,plotting}."
+    url = "/gradio_api/file=" + os.path.abspath(src_path)
+    if mode == "audio":
+        return (
+            '<div class="co-video-wrap">'
+            f'<audio id="tm-video" controls preload="metadata" src="{url}">'
+            "Your browser can't play this audio.</audio></div>"
+        )
+    if mode == "video":
+        suffix = Path(src_path).suffix.lower().lstrip(".") or "mp4"
+        return ui.video_html(url, mime=f"video/{suffix}")
+    # text mode: synthesized speech is internal; no preview element.
+    return (
+        '<div class="co-video-wrap"><div class="co-video-empty">'
+        "synthesized speech (no preview) — timeline below</div></div>"
     )
 
 
-# ---------------------------------------------------------------------------
-# UI shell
-# ---------------------------------------------------------------------------
+def _enter_loading():
+    """First click step: reveal the loading state, hide the others."""
+    return (
+        gr.update(visible=False),  # empty
+        gr.update(visible=True),   # loading
+        gr.update(visible=False),  # error
+        gr.update(visible=False),  # result_grp
+    )
+
+
+def _ok(media, fig, summary_html_str):
+    """Success update tuple for [empty, loading, error, result_grp, media, timeline, summary]."""
+    return (
+        gr.update(visible=False),
+        gr.update(visible=False),
+        gr.update(visible=False),
+        gr.update(visible=True),
+        gr.update(value=media),
+        gr.update(value=fig),
+        gr.update(value=summary_html_str),
+    )
+
+
+def _fail(message: str):
+    """Error update tuple (same 7 outputs)."""
+    return (
+        gr.update(visible=False),
+        gr.update(visible=False),
+        gr.update(value=ui.error_html(message), visible=True),
+        gr.update(visible=False),
+        gr.update(),
+        gr.update(),
+        gr.update(),
+    )
+
+
+def _score_impl(mode, src_path, selected_names, audio_only, progress):
+    """Shared pipeline: validate -> GPU predict -> stitch -> metrics -> figure.
+
+    Returns the 7-output update tuple for the results column.
+    """
+    try:
+        if not src_path:
+            return _fail("Add an input first, then press Score.")
+
+        # Default to the three ON metrics if the user cleared the selection.
+        names = list(selected_names) if selected_names else list(ui.METRICS_DEFAULT_ON)
+        keys = [NAME_TO_KEY[n] for n in names if n in NAME_TO_KEY]
+        if not keys:
+            return _fail("Pick at least one brain metric to plot.")
+
+        # Duration guard (media modes only; §11.3).
+        if mode in ("video", "audio"):
+            dur = _probe_duration_s(src_path)
+            if dur is not None and dur > MAX_DURATION_S + 1:
+                mins = dur / 60.0
+                return _fail(
+                    f"This clip is {mins:.1f} min; the max is "
+                    f"{MAX_DURATION_S // 60} min. Trim it and try again."
+                )
+
+        progress(0.05, desc="Preparing input…")
+        if mode == "text":
+            if not str(src_path).strip():
+                return _fail("Enter some text to score.")
+
+        progress(0.15, desc="Running tribev2 on ZeroGPU (feature extraction + prediction)…")
+        preds, abs_times = _gpu_infer(mode, src_path, bool(audio_only))
+
+        if preds.shape[0] == 0:
+            return _fail(
+                "The model returned no predictions for this input. If it's very "
+                "short or silent, try a longer clip with speech."
+            )
+
+        progress(0.75, desc="Stitching windows + reducing to metrics…")
+        timeline, t_axis = stitch(preds, abs_times)
+        masks = _get_masks()
+        curves_by_key = to_metrics(timeline, masks)  # keyed by PARCELS key
+
+        # Re-key to UI display names; keep only the selected metrics.
+        curves = {
+            KEY_TO_NAME[k]: v for k, v in curves_by_key.items() if k in KEY_TO_NAME
+        }
+        selected_display = [KEY_TO_NAME[k] for k in keys]
+
+        progress(0.92, desc="Rendering timeline…")
+        fig = timeline_figure(t_axis, curves, selected=selected_display)
+
+        # Summary for the selected metrics; adapt summary()'s peak_time -> peak_t.
+        sel_curves = {n: curves[n] for n in selected_display if n in curves}
+        stats = summary(sel_curves)
+        stats_html = {
+            n: {"peak": s["peak"], "mean": s["mean"], "peak_t": s["peak_time"]}
+            for n, s in stats.items()
+        }
+        summary_str = ui.summary_html(stats_html)
+
+        progress(1.0, desc="Done.")
+        media = _media_html(mode, src_path)
+        return _ok(media, fig, summary_str)
+
+    except Exception as exc:  # surface a clean, actionable message
+        logger.exception("scoring failed")
+        msg = str(exc).strip() or exc.__class__.__name__
+        # The gated-Llama case has a recognisable signature.
+        if "gated" in msg.lower() or "403" in msg or "awaiting" in msg.lower():
+            msg = (
+                "The text backbone (Llama-3.2-3B) isn't accessible yet. Try the "
+                "<strong>Audio-only (debug)</strong> toggle, which skips it."
+            )
+        return _fail(msg)
+
+
+# --- app --------------------------------------------------------------------
+_RESULT_OUTPUTS_KEYS = (
+    "empty", "loading", "error", "result_grp", "media_html", "timeline", "summary",
+)
+
+
 def build_demo() -> gr.Blocks:
-    """Build the Gradio Blocks UI (no model touched here)."""
-    with gr.Blocks(title="TRIBE v2 Video Brain-Score") as demo:
-        gr.Markdown(
-            f"""
-            # TRIBE v2 Video Brain-Score
+    with gr.Blocks(theme=theme.build_theme(), css=theme.CSS, title="TRIBE v2 Video Brain-Score") as demo:
+        gr.HTML(
+            '<div class="co-masthead">'
+            '<div class="co-wordmark">TRIBE&nbsp;v2 '
+            '<span class="co-wordmark-sub">· Video Brain-Score</span></div>'
+            '<div class="co-status-dot">in-silico neuroscience</div>'
+            "</div>"
+        )
+        if on_spaces():
+            gr.HTML(
+                '<div class="co-quota">⚡ Runs on <strong>ZeroGPU</strong> — each '
+                "Score reserves a GPU slot from <strong>your</strong> daily "
+                "allowance. Heaviest: Video · lightest: Text.</div>"
+            )
 
-            Score a 4-5 minute video with **`{DEFAULT_MODEL_ID}`** and plot
-            derived **brain-metric** curves -- *attention*, *virality*,
-            *engagement* -- across the full timeline.
+        with gr.Row(equal_height=False):
+            # Left rail: the mode-switcher (Video / Audio / Text).
+            with gr.Column(scale=4, elem_classes=["co-rail"]):
+                with gr.Tabs():
+                    with gr.Tab("🎬 Video"):
+                        v = ui.build_video_tab()
+                    with gr.Tab("🔊 Audio"):
+                        a = ui.build_audio_tab()
+                    with gr.Tab("📝 Text"):
+                        t = ui.build_text_tab()
 
-            > **Note:** these curves are *derived, heuristic* interpretations
-            > of predicted fMRI-like brain activity, mapped from cortical
-            > regions of interest. They are exploratory, not validated
-            > measurements. See the README / NOTICE.
+            # Right hero: the synchronized readout (shared across modes).
+            with gr.Column(scale=6):
+                r = ui.build_results()
 
-            > **TODO:** wire `score_video` to the `tribescore` pipeline. Model
-            > execution runs on **ZeroGPU** (this UI shell imports without the
-            > model present).
-            """
+        gr.HTML(
+            f'<div class="co-footer">tribescore v{__version__} · model '
+            f'<code>{DEFAULT_MODEL_ID}</code> (CC-BY-NC-4.0, non-commercial '
+            "research demo) · curves are a derived research proxy, not validated "
+            "measurements</div>"
         )
 
-        with gr.Row():
-            video_url = gr.Textbox(
-                label="Video URL",
-                value=DEFAULT_VIDEO_URL,
-                placeholder="https://.../clip.mp4  (4-5 min, .mp4/.mkv/.mov/.webm)",
-            )
-        run_btn = gr.Button("Score video", variant="primary")
-        plot = gr.Plot(label="Derived brain metrics over time")
+        result_outputs = [r[k] for k in _RESULT_OUTPUTS_KEYS]
+        loading_outputs = [r["empty"], r["loading"], r["error"], r["result_grp"]]
+        js_seek = seek_js()
 
-        # Wiring is in place; the callback itself is a guarded TODO until the
-        # Space-side pipeline lands.
-        run_btn.click(fn=score_video, inputs=[video_url], outputs=[plot])
+        # Sample clip → fill the Video component.
+        v["sample_btn"].click(fn=lambda: SAMPLE_VIDEO_URL, inputs=None, outputs=[v["video"]])
 
-        gr.Markdown(f"<sub>tribescore v{__version__}</sub>")
+        # --- Video ---
+        v["run_btn"].click(_enter_loading, None, loading_outputs).then(
+            lambda vid, metrics, ao, pr=gr.Progress(): _score_impl("video", vid, metrics, ao, pr),
+            inputs=[v["video"], v["metrics"], v["audio_only"]],
+            outputs=result_outputs,
+        ).then(fn=None, js=js_seek)
+
+        # --- Audio ---
+        a["run_btn"].click(_enter_loading, None, loading_outputs).then(
+            lambda aud, metrics, ao, pr=gr.Progress(): _score_impl("audio", aud, metrics, ao, pr),
+            inputs=[a["audio"], a["metrics"], a["audio_only"]],
+            outputs=result_outputs,
+        ).then(fn=None, js=js_seek)
+
+        # --- Text ---
+        t["run_btn"].click(_enter_loading, None, loading_outputs).then(
+            lambda txt, metrics, pr=gr.Progress(): _score_impl(
+                "text", _text_to_tmp(txt[:MAX_TEXT_CHARS]) if txt else "", metrics, False, pr
+            ),
+            inputs=[t["text"], t["metrics"]],
+            outputs=result_outputs,
+        ).then(fn=None, js=js_seek)
 
     return demo
 
 
-# Module-level handle so `gradio app.py` / Spaces autodetection can find it,
-# without launching at import (guarded by the __main__ check below).
 demo = build_demo()
 
 
 if __name__ == "__main__":
-    demo.launch()
+    # concurrency 1: one heavy ZeroGPU task at a time. ssr_mode False + show_error
+    # so prediction-function exceptions surface in the UI + logs (§7).
+    demo.queue(default_concurrency_limit=1).launch(
+        show_error=True,
+        ssr_mode=False,
+        allowed_paths=[CACHE_DIR, tempfile.gettempdir()],
+    )

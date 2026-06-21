@@ -9,15 +9,31 @@ succeeds on a CPU-only machine with none of those installed. The actual model
 load and forward pass happen exclusively on the Hugging Face ZeroGPU Space,
 behind an ``@spaces.GPU``-decorated entrypoint in ``app.py``.
 
-Reference API (from ``tribev2.demo_utils.TribeModel``)::
+Reference API (from ``tribev2.demo_utils.TribeModel`` -- verified against the
+upstream source, ``docs/PLAN.md`` §3)::
 
-    model  = TribeModel.from_pretrained("facebook/tribev2")
+    from tribev2 import TribeModel
+    model  = TribeModel.from_pretrained(
+        "facebook/tribev2",
+        cache_folder=CACHE_DIR,
+        device="auto",
+        config_update={"data.overlap_trs_train": 20},  # 20 s overlap, §4
+    )
     events = model.get_events_dataframe(video_path="clip.mp4")
-    preds, segments = model.predict(events)   # preds: (T, n_vertices)
+    preds, segments = model.predict(events)   # preds: (R, 20484)
 
-Each row of ``preds`` is one fMRI TR; each ``segment`` carries an ``offset``
-and ``duration`` that locate that row on the video timeline -- which is what
-:mod:`tribescore.windowing` needs to build a shared time axis.
+Each row of ``preds`` is one fMRI TR (TR = 1.0 s, so one row per second);
+each ``segment`` carries an absolute ``.start`` (seconds on the input clock)
+that locates that row on the media timeline -- which is what
+:mod:`tribescore.windowing` needs to build a shared time axis. The window
+length is **fixed at 100 s** by the checkpoint pooler (``n_output_timesteps``
+is baked into the ckpt; §3); the only loader knob we set is
+``data.overlap_trs_train = 20`` to get overlapping 100 s windows at an 80 s
+stride.
+
+**This file never decorates anything with ``@spaces.GPU``** so it stays
+importable without the ``spaces`` package. The caller in ``app.py`` wraps
+:func:`run_inference` in ``@spaces.GPU(duration=480)`` (§7).
 """
 
 from __future__ import annotations
@@ -39,6 +55,38 @@ DEFAULT_MODEL_ID = "facebook/tribev2"
 #: Default cortical mesh used by the model / plotter (matches the reference
 #: Space's ``PlotBrain(mesh="fsaverage5")``).
 DEFAULT_MESH = "fsaverage5"
+
+#: Loader-time config override applied at ``from_pretrained``. 20 TR (= 20 s,
+#: TR = 1.0 s) overlap on the ``"all"`` split's segmenter ⇒ overlapping 100 s
+#: windows at an 80 s stride (``docs/PLAN.md`` §3/§4). ``data.duration_trs`` is
+#: deliberately NOT touched -- the checkpoint pooler locks the window at 100 s
+#: and changing it crashes ``predict()`` (§3, R8).
+CONFIG_UPDATE: dict[str, int] = {"data.overlap_trs_train": 20}
+
+#: Valid ``mode`` values accepted by :func:`run_inference`. These map onto the
+#: ``{mode}_path`` keyword of ``TribeModel.get_events_dataframe``.
+VALID_MODES: tuple[str, ...] = ("video", "audio", "text")
+
+#: Modes for which the interim ``audio_only`` path (skip ASR + Llama) is valid.
+#: Text mode synthesises speech from text and *requires* the full pipeline, so
+#: ``audio_only`` is rejected there.
+_AUDIO_ONLY_MODES: tuple[str, ...] = ("video", "audio")
+
+#: ``type`` column value for the one-row events DataFrame, per ``mode``. Mirrors
+#: ``TribeModel.get_events_dataframe`` (``"Audio"`` for audio, ``"Video"`` for
+#: video). Used only by the ``audio_only`` branch.
+_EVENT_TYPE_BY_MODE: dict[str, str] = {"video": "Video", "audio": "Audio"}
+
+
+# ---------------------------------------------------------------------------
+# Module-level model singleton
+# ---------------------------------------------------------------------------
+
+#: Cached, loaded model. Populated on the first :func:`load_model` call so the
+#: 708 MB checkpoint is downloaded/built once and reused across every
+#: ``@spaces.GPU`` invocation (the ``spaces`` runtime keeps the module alive
+#: between GPU sessions; §7).
+_MODEL: Any | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +124,9 @@ def assert_model_runtime() -> None:
 
     Call this at the top of any function that is about to load or run the
     model, so failures are explicit instead of surfacing as opaque
-    ``ImportError``/CUDA errors deep in a call stack.
+    ``ImportError``/CUDA errors deep in a call stack. This is the guard that
+    keeps the module importable off-Space while making an *actual* model
+    invocation off-Space fail loudly (``docs/PLAN.md`` §0, T-A).
     """
     missing = []
     if not torch_available():
@@ -92,121 +142,278 @@ def assert_model_runtime() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Model load + windowed prediction
+# Model load (module-level singleton)
 # ---------------------------------------------------------------------------
 
 
-def load_model(
-    model_id: str = DEFAULT_MODEL_ID,
-    *,
-    cache_folder: str | Path = "cache",
-    device: str = "auto",
-) -> Any:
-    """Load the TRIBE v2 model from the Hub (Space-only).
+def load_model(cache_dir: str, *, model_id: str = DEFAULT_MODEL_ID) -> Any:
+    """Load the TRIBE v2 model from the Hub once and cache it (Space-only).
 
-    Lazily imports ``tribev2`` and returns a ready ``TribeModel`` in eval
-    mode. This is expensive (downloads weights, allocates GPU memory) and
-    must only run on the Space.
+    Implements ``docs/PLAN.md`` §9 T-A. Lazily imports ``tribev2`` and returns
+    a ready ``TribeModel`` in eval mode, built with the locked
+    :data:`CONFIG_UPDATE` (``overlap_trs_train = 20``). The result is memoised
+    in the module-level :data:`_MODEL` singleton so the 708 MB checkpoint is
+    downloaded/built only on the first call and reused across every
+    ``@spaces.GPU`` invocation.
+
+    Building the model downloads ``config.yaml`` + ``best.ckpt`` only; the
+    modality backbones (incl. gated Llama) load lazily inside ``predict()`` and
+    are freed afterwards, so this call succeeds even before Meta approves Llama
+    access -- only live inference of the text path would 403 (§3).
 
     Parameters
     ----------
+    cache_dir:
+        Directory for cached weights/features (the persistent ``/data`` mount
+        on the Space when available; ``docs/PLAN.md`` §7). Created by
+        ``from_pretrained`` if it does not exist.
     model_id:
-        Hugging Face Hub repo id of the checkpoint.
-    cache_folder:
-        Directory for cached features/weights.
-    device:
-        Torch device string; ``"auto"`` selects CUDA when available.
+        Hugging Face Hub repo id of the checkpoint. Defaults to
+        :data:`DEFAULT_MODEL_ID` (``"facebook/tribev2"``).
 
     Returns
     -------
-    tribev2.demo_utils.TribeModel
-        Loaded model instance.
+    tribev2.TribeModel
+        Loaded model instance, ready for ``get_events_dataframe`` / ``predict``.
 
-    Notes
-    -----
-    Deferred (TODO). Mirror the reference Space::
-
-        from tribev2.demo_utils import TribeModel
-        return TribeModel.from_pretrained(model_id,
-                                          cache_folder=str(cache_folder),
-                                          device=device)
+    Raises
+    ------
+    RuntimeError
+        If invoked off-Space where the model runtime is unavailable (see
+        :func:`assert_model_runtime`).
     """
+    global _MODEL
+    if _MODEL is not None:
+        return _MODEL
+
     assert_model_runtime()
-    raise NotImplementedError(
-        "load_model is wired up on the Space. See the docstring for the "
-        "two-line TribeModel.from_pretrained body."
+
+    # Deferred import: the heavy stack is touched only here, only on the Space.
+    from tribev2 import TribeModel
+
+    _MODEL = TribeModel.from_pretrained(
+        model_id,
+        cache_folder=str(cache_dir),
+        device="auto",
+        config_update=dict(CONFIG_UPDATE),
     )
+    return _MODEL
 
 
-def build_events(model: Any, video_path: str | Path) -> "pd.DataFrame":
-    """Build the events DataFrame for a video (Space-only).
-
-    Thin pass-through to ``TribeModel.get_events_dataframe(video_path=...)``,
-    which extracts audio, transcribes words, and attaches sentence/context
-    annotations.
-
-    TODO (on Space): ``return model.get_events_dataframe(video_path=str(video_path))``
-    """
-    assert_model_runtime()
-    raise NotImplementedError("build_events is wired up on the Space.")
+# ---------------------------------------------------------------------------
+# Inference (the whole-video predict, approach B; §4)
+# ---------------------------------------------------------------------------
 
 
-def predict_window(
+def run_inference(
     model: Any,
-    events: "pd.DataFrame",
-    start_s: float,
-    end_s: float,
+    mode: str,
+    src_path: str,
+    *,
+    audio_only: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Predict brain activity for one time window -- the injected ``infer_fn``.
+    """Run one whole-clip ``predict()`` and return per-TR activity + abs times.
 
-    This is the concrete function that :func:`tribescore.windowing.run_windowed`
-    calls per window (wrapped in a closure binding ``model`` and ``events``).
-    It slices ``events`` to ``[start_s, end_s)``, runs ``model.predict``, and
-    returns the window's activity plus per-row offsets *relative to*
-    ``start_s`` -- exactly the :class:`tribescore.windowing.WindowResult`
-    contract.
+    Implements ``docs/PLAN.md`` §9 T-A (approach B, §4): a single
+    ``get_events_dataframe`` + single ``predict`` per Run. With
+    ``overlap_trs_train = 20`` set at load time, tribev2's own segmenter tiles
+    the clip into overlapping 100 s windows (80 s stride) internally, so this
+    one call covers the entire video; :func:`tribescore.windowing.stitch` then
+    re-assembles a continuous 1 Hz timeline from the returned ``abs_times``.
+
+    .. note::
+        **The caller decorates this with** ``@spaces.GPU(duration=480)`` (§7).
+        It is intentionally left undecorated here so the module imports without
+        the ``spaces`` package.
+
+    Parameters
+    ----------
+    model:
+        A loaded ``TribeModel`` (from :func:`load_model`).
+    mode:
+        One of :data:`VALID_MODES` (``"video"``, ``"audio"``, ``"text"``).
+        Selects the ``{mode}_path`` keyword of ``get_events_dataframe``.
+    src_path:
+        Path to the input media (or ``.txt`` for ``mode == "text"``).
+    audio_only:
+        Interim fast path (``video``/``audio`` modes only) that **skips ASR +
+        Llama** by building the events via
+        ``get_audio_and_text_events(df, audio_only=True)``. Used to validate
+        the heavy GPU pipeline (V-JEPA2 + DINOv2 + W2V-BERT) + windowing +
+        metrics on-Space before Meta approves Llama (§12 step 4). The model
+        tolerates the missing text modality (``modality_dropout``; R4).
+
+    Returns
+    -------
+    preds : np.ndarray
+        Shape ``(R, 20484)`` -- per-TR predicted cortical activity on the
+        fsaverage5 mesh (LH ``[0:10242]`` then RH ``[10242:20484]``; §3).
+    abs_times : np.ndarray
+        Shape ``(R,)``, dtype float -- ``round(segment.start)`` for each row,
+        i.e. the absolute second on the input clock that the row predicts.
+        These carry the within-window ascent + backward-jump-at-seam structure
+        that :func:`tribescore.windowing.stitch` keys on (§4 step 3a).
+
+    Raises
+    ------
+    ValueError
+        If ``mode`` is not in :data:`VALID_MODES`, or ``audio_only`` is set for
+        ``mode == "text"`` (text requires the full TTS + ASR + Llama path).
+    RuntimeError
+        If invoked off-Space where the model runtime is unavailable.
+    """
+    if mode not in VALID_MODES:
+        raise ValueError(
+            f"mode must be one of {VALID_MODES}, got {mode!r}"
+        )
+    if audio_only and mode not in _AUDIO_ONLY_MODES:
+        raise ValueError(
+            "audio_only is only valid for video/audio modes (text mode "
+            "synthesises speech and needs the full ASR + Llama pipeline)"
+        )
+
+    assert_model_runtime()
+
+    if audio_only:
+        events = _build_audio_only_events(mode, src_path)
+    else:
+        events = model.get_events_dataframe(**{f"{mode}_path": src_path})
+
+    preds, segments = model.predict(events)
+    preds = np.asarray(preds, dtype=float)
+    abs_times = np.array([round(seg.start) for seg in segments], dtype=float)
+    return preds, abs_times
+
+
+def _build_audio_only_events(mode: str, src_path: str) -> "pd.DataFrame":
+    """Build the one-row events DataFrame for the ``audio_only`` path.
+
+    Reproduces the event row that ``TribeModel.get_events_dataframe`` builds
+    for audio/video, then routes it through
+    ``tribev2.demo_utils.get_audio_and_text_events(df, audio_only=True)`` so
+    the ASR (whisperx) + Llama-context transforms are skipped (§9 T-A).
+
+    Deferred import keeps the module CPU-importable.
+    """
+    import pandas as pd
+
+    from tribev2.demo_utils import get_audio_and_text_events
+
+    event = {
+        "type": _EVENT_TYPE_BY_MODE[mode],
+        "filepath": str(src_path),
+        "start": 0,
+        "timeline": "default",
+        "subject": "default",
+    }
+    df = pd.DataFrame([event])
+    return get_audio_and_text_events(df, audio_only=True)
+
+
+# ---------------------------------------------------------------------------
+# Fallback: per-window ffmpeg trim + predict (§4 "Fallback"; only if approach
+# B's overlap-config / .start realignment misbehaves on-Space)
+# ---------------------------------------------------------------------------
+
+
+def infer_window(
+    model: Any,
+    clip_path: str,
+    window_start: float,
+    *,
+    win_s: int = 100,
+    mode: str = "video",
+    audio_only: bool = False,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Predict one explicit 100 s window via an ``ffmpeg`` trim (FALLBACK).
+
+    Implements the ``docs/PLAN.md`` §4 *Fallback*: trim ``clip_path`` to
+    ``[window_start, window_start + win_s]`` with ``ffmpeg``, run
+    ``get_events_dataframe`` + ``predict`` on the trimmed clip, and tag each
+    returned row with an absolute time of ``window_start + p`` (``p`` = the
+    0-based intra-window TR index). This is deterministic by construction (no
+    reliance on ``list_segments`` / ``.start`` realignment or overlap dedup),
+    at the cost of N backbone load/free cycles. The caller drives one window
+    per ``plan_windows`` span and feeds every ``(preds, abs_times)`` pair into
+    the same :func:`tribescore.windowing.stitch`.
+
+    .. note::
+        The caller decorates this with ``@spaces.GPU(duration≈200)`` -- one
+        bounded GPU session per window (§7). Undecorated here for importability.
+        Shells out to ``ffmpeg`` only on the Space.
 
     Parameters
     ----------
     model:
         A loaded ``TribeModel``.
-    events:
-        Full-video events DataFrame from :func:`build_events`.
-    start_s, end_s:
-        Absolute window bounds in seconds.
+    clip_path:
+        Path to the full-length source media.
+    window_start:
+        Absolute start time of this window, in seconds (a ``plan_windows``
+        span's left edge).
+    win_s:
+        Window length in seconds. Fixed at 100 (the checkpoint pooler lock;
+        §3) -- do not change.
+    mode:
+        ``"video"`` or ``"audio"`` (the fallback covers media modes; text uses
+        the whole-clip path).
+    audio_only:
+        Skip ASR + Llama, as in :func:`run_inference`.
 
     Returns
     -------
-    activity : np.ndarray
-        Shape ``(t_window, n_vertices)``.
-    offsets_s : np.ndarray
-        Shape ``(t_window,)``; seconds from ``start_s`` for each row,
-        derived from each returned segment's ``offset``.
+    preds : np.ndarray
+        Shape ``(R, 20484)`` for this window.
+    abs_times : np.ndarray
+        Shape ``(R,)``, dtype float -- ``window_start + p`` for each row.
 
-    Notes
-    -----
-    Deferred (TODO). Sketch::
-
-        window_events = slice_events(events, start_s, end_s)
-        preds, segments = model.predict(window_events)
-        offsets = np.array([seg.offset - start_s for seg in segments])
-        return preds, offsets
-
-    ``preds`` already has shape ``(n_segments, n_vertices)`` and each segment
-    exposes ``.offset`` / ``.duration`` (see ``TribeModel.predict``).
+    Raises
+    ------
+    ValueError
+        If ``mode`` is not ``"video"``/``"audio"``.
+    RuntimeError
+        If invoked off-Space, or if the ``ffmpeg`` trim fails.
     """
+    if mode not in _AUDIO_ONLY_MODES:
+        raise ValueError(
+            f"infer_window supports video/audio modes only, got {mode!r}"
+        )
+
     assert_model_runtime()
-    raise NotImplementedError("predict_window is wired up on the Space.")
 
+    import subprocess
+    import tempfile
 
-def slice_events(
-    events: "pd.DataFrame", start_s: float, end_s: float
-) -> "pd.DataFrame":
-    """Return the subset of events overlapping ``[start_s, end_s)``.
+    suffix = Path(clip_path).suffix or (".mp4" if mode == "video" else ".wav")
+    with tempfile.TemporaryDirectory() as tmp:
+        clip = str(Path(tmp) / f"window{suffix}")
+        # Trim [window_start, window_start + win_s]; re-encode so the cut is
+        # frame-accurate (input seeking with -c copy lands on keyframes).
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-ss",
+            str(float(window_start)),
+            "-i",
+            str(clip_path),
+            "-t",
+            str(float(win_s)),
+            clip,
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg trim failed for window at {window_start}s: "
+                f"{proc.stderr.strip()[-500:]}"
+            )
 
-    Keeps any event whose ``[start, start + duration)`` span intersects the
-    window, then rebases ``start`` so the slice is window-local.
+        if audio_only:
+            events = _build_audio_only_events(mode, clip)
+        else:
+            events = model.get_events_dataframe(**{f"{mode}_path": clip})
+        preds, segments = model.predict(events)
 
-    TODO: implement against the real events schema. Pure pandas, no model.
-    """
-    raise NotImplementedError("slice_events is implemented alongside the wrapper.")
+    preds = np.asarray(preds, dtype=float)
+    # Deterministic x-axis: the p-th retained row sits at window_start + p.
+    abs_times = window_start + np.arange(preds.shape[0], dtype=float)
+    return preds, abs_times
