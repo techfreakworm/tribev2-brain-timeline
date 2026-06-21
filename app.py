@@ -332,7 +332,7 @@ _RESULT_OUTPUTS_KEYS = (
 
 
 def build_demo() -> gr.Blocks:
-    with gr.Blocks(theme=theme.build_theme(), css=theme.CSS, title="TRIBE v2 Video Brain-Score") as demo:
+    with gr.Blocks(title="TRIBE v2 Video Brain-Score") as demo:
         gr.HTML(
             '<div class="co-masthead">'
             '<div class="co-wordmark">TRIBE&nbsp;v2 '
@@ -409,6 +409,8 @@ if __name__ == "__main__":
     # concurrency 1: one heavy ZeroGPU task at a time. ssr_mode False + show_error
     # so prediction-function exceptions surface in the UI + logs (§7).
     demo.queue(default_concurrency_limit=1).launch(
+        theme=theme.build_theme(),
+        css=theme.CSS,
         show_error=True,
         ssr_mode=False,
         allowed_paths=[CACHE_DIR, tempfile.gettempdir()],

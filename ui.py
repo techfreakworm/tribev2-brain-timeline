@@ -83,11 +83,12 @@ def _audio_only_toggle() -> gr.components.Component:
     the heavy pipeline be validated on-Space before Meta approval.
     """
     return gr.Checkbox(
-        value=False,
-        label="Audio-only (debug)",
+        value=True,
+        label="⚡ Fast mode — skip speech-to-text (recommended)",
         info=(
-            "Skip speech-to-text + the gated Llama text path. Faster; "
-            "validates the pipeline before model access is granted."
+            "On (default): scores the video + audio brain response — fast and "
+            "reliable. Uncheck for full multimodal incl. spoken-text features "
+            "(much slower: downloads a large ASR stack on first use)."
         ),
     )
 
