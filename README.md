@@ -59,24 +59,31 @@ outputs (overlap-averaged, Hann-tapered) onto a single shared time axis.
 
 ## Methodology
 
-> **Status: placeholder mapping.** The ROI→metric definitions below are an
-> editorial starting point and are marked `TODO` in the code; they will be
-> replaced with a concrete, cited parcellation and tuned weights.
+`facebook/tribev2` outputs predicted fMRI activity over the cortical surface as
+a `(T, 20484)` array on the **fsaverage5** mesh (`20484 = 2 × 10242` vertices,
+left hemisphere then right), one row per fMRI **TR** (TR = 1 s ⇒ 1 Hz). We
+reduce that to named curves by averaging activity within **HCP-MMP1 (Glasser
+2016)** cortical parcels — via tribev2's own shipped atlas helper
+(`tribev2.utils.get_hcp_roi_indices`), so vertex indices are already aligned to
+the model's output space.
 
-`facebook/tribev2` outputs brain activity over the cortical surface as a
-`(T, n_vertices)` array on a standard mesh (`fsaverage5`). We map that to
-metrics by aggregating activity within **regions of interest (ROIs)** from a
-parcellation, then taking a signed weighted combination per metric:
+| Metric | Cortical parcels (HCP-MMP1) | Basis |
+| --- | --- | --- |
+| **Attention** | dorsal attention (FEF, IPS: LIP/VIP/MIP/AIP/IP0–2) + ventral attention (TPOJ, PGi/PGs/PFm, IFJ) + frontoparietal control (DLPFC) | attention-network fMRI |
+| **Engagement / arousal** | early visual + motion (V1–V4, MT/MST) + auditory (A1, belts, A4/A5) + STS | sensory + associative drive |
+| **Virality (proxy)** | vmPFC / mOFC / pgACC / mPFC value regions (10r/10v/10d, p32/s32, a24/d32, OFC, 9m, …) | neuroforecasting value signal — Genevsky & Knutson 2015; Genevsky 2017; Scholz et al. 2017 (PNAS); Doré et al. 2019 |
+| *Language / semantic load* (optional) | core language network (44/45, IFSa, STG/STS, PSL, SFL, 55b) | text + audio driven |
+| *Self-relevance / DMN* (optional) | default-mode (7m, v23ab/d23ab, 31pv/pd, RSC, PCV, 9m, …) | self / social relevance |
 
-| Metric         | Intuition (placeholder ROI grouping)                                   |
-| -------------- | ---------------------------------------------------------------------- |
-| **attention**  | fronto-parietal / dorsal-attention + sensory cortex, minus default-mode |
-| **virality**   | limbic reward / affective salience + ventral-attention orienting        |
-| **engagement** | overall cortical involvement (global activity)                          |
+Per TR we take the mean over each metric's parcel vertices, z-score over the
+full timeline, and Gaussian-smooth (σ ≈ 2 s). The reduction is implemented in
+`src/tribescore/metrics.py` and unit-tested with synthetic masks.
 
-The reduction math (ROI means → weighted combine → smooth → rescale) is fully
-implemented and unit-tested with a synthetic atlas; only the *anatomical*
-groupings are placeholders.
+> ⚠️ **"Virality" is a research proxy**, not a guarantee. tribev2 is
+> cortical-only (no ventral striatum / NAcc — the strongest neuroforecasting
+> node), so this is the validated vmPFC/mPFC *complement*. Because the model's
+> training target was per-sample z-scored + detrended, **absolute scores are
+> meaningless — only relative temporal dynamics are valid.**
 
 ## Model execution runs on ZeroGPU
 
