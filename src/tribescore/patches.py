@@ -93,10 +93,10 @@ def apply_batched_video_encode(batch_size: int = 8) -> bool:
     def _batched_get_data(self, events):
         # Only handle the native-video (vjepa2) path; defer everything else.
         if not any(z in self.image.model_name for z in _HFVideoModel.MODELS):
-            yield from _orig(self, events)
+            yield from _orig.__get__(self, type(self))(events)
             return
         if "vjepa2" not in self.image.model_name:
-            yield from _orig(self, events)
+            yield from _orig.__get__(self, type(self))(events)
             return
         try:
             model = _HFVideoModel(
@@ -184,7 +184,7 @@ def apply_batched_video_encode(batch_size: int = 8) -> bool:
                 )
         except Exception as exc:  # never break inference -> fall back to the slow, correct path
             logger.warning("batched encode failed (%r); falling back to original", exc)
-            yield from _orig(self, events)
+            yield from _orig.__get__(self, type(self))(events)
 
     cls._get_data = _batched_get_data
     cls._tribescore_batched = True

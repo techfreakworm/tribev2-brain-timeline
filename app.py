@@ -178,7 +178,7 @@ def _gpu_infer(mode: str, src_path: str, audio_only: bool):
     try:
         from tribescore.patches import apply_bf16_video_encode, apply_batched_video_encode
         apply_bf16_video_encode()
-        apply_batched_video_encode(batch_size=8)  # batch the V-JEPA2 loop (~3-8x)
+        apply_batched_video_encode(batch_size=4)  # batch the V-JEPA2 loop (B=4 ~32GB/48 safe)
     except Exception:
         pass
     out = run_inference(model, mode, src_path, audio_only=audio_only)
