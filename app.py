@@ -83,7 +83,9 @@ def _resolve_cache_dir() -> str:
 
 CACHE_DIR = _resolve_cache_dir()
 # Point MNE's data dir at the cache so the HCP-MMP atlas download is reused.
+# mne requires MNE_DATA to be an EXISTING directory, so create it up front.
 os.environ.setdefault("MNE_DATA", os.path.join(CACHE_DIR, "mne_data"))
+os.makedirs(os.environ["MNE_DATA"], exist_ok=True)
 
 
 # --- spaces.GPU shim: real decorator on the Space, no-op locally ------------
