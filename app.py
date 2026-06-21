@@ -92,6 +92,27 @@ os.environ.setdefault("MNE_DATA", os.path.join(CACHE_DIR, "mne_data"))
 os.makedirs(os.environ["MNE_DATA"], exist_ok=True)
 
 
+def _ensure_writable_hub() -> None:
+    """Make the HF hub cache writable for runtime downloads (whisper + LLaMA).
+
+    preload_from_hub bakes ~/.cache/huggingface/hub into the image at BUILD owned
+    by the build user, so uid 1000 can't create the NEW repo dirs the opt-in ASR
+    (faster-whisper) + LLaMA need at runtime -> EACCES. Copy the preloaded tree
+    once into a writable dir and redirect HF_HUB_CACHE there (preserves preload
+    -> no re-download; now writable). Idempotent; only invoked on the opt-in
+    full-multimodal path so the fast default path stays lean.
+    """
+    import shutil
+
+    target = os.path.join(CACHE_DIR, "hub")
+    default_hub = os.path.expanduser("~/.cache/huggingface/hub")
+    if not os.path.isdir(target) or not os.listdir(target):
+        os.makedirs(target, exist_ok=True)
+        if os.path.isdir(default_hub):
+            shutil.copytree(default_hub, target, dirs_exist_ok=True)
+    os.environ["HF_HUB_CACHE"] = target
+
+
 # --- spaces.GPU shim: real decorator on the Space, no-op locally ------------
 try:  # pragma: no cover - exercised only where `spaces` is installed
     import spaces
@@ -132,6 +153,13 @@ if on_spaces():
 def _gpu_infer(mode: str, src_path: str, audio_only: bool):
     """Run one whole-clip predict() on ZeroGPU. Everything else is CPU."""
     model = load_model(CACHE_DIR)  # singleton: instant after eager startup load
+    if not audio_only:
+        # Opt-in full-multimodal path downloads NEW repos (whisper, LLaMA) into
+        # the hub cache, which preload baked read-only -> make it writable first.
+        try:
+            _ensure_writable_hub()
+        except Exception:
+            pass
     _torch = None
     try:  # TF32 fast matmul/conv (no result change) + peak-VRAM telemetry (logs)
         import torch as _torch
@@ -148,8 +176,9 @@ def _gpu_infer(mode: str, src_path: str, audio_only: bool):
     # previously made outputs bf16 and broke tribev2's internal .numpy()).
     # V-JEPA2 only; audio/text/head stay fp32. TF32 also on.
     try:
-        from tribescore.patches import apply_bf16_video_encode
+        from tribescore.patches import apply_bf16_video_encode, apply_batched_video_encode
         apply_bf16_video_encode()
+        apply_batched_video_encode(batch_size=8)  # batch the V-JEPA2 loop (~3-8x)
     except Exception:
         pass
     out = run_inference(model, mode, src_path, audio_only=audio_only)
