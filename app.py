@@ -17,8 +17,14 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import tempfile
 from pathlib import Path
+
+# src-layout: the local ``tribescore`` package lives under ``src/``. HF Spaces
+# runs this file from the repo root with no editable install, so make the
+# package importable by putting ``<repo>/src`` on the path before importing it.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
 import gradio as gr
 
