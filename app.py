@@ -132,7 +132,20 @@ if on_spaces():
 def _gpu_infer(mode: str, src_path: str, audio_only: bool):
     """Run one whole-clip predict() on ZeroGPU. Everything else is CPU."""
     model = load_model(CACHE_DIR)  # singleton: instant after eager startup load
-    return run_inference(model, mode, src_path, audio_only=audio_only)
+    _torch = None
+    try:  # peak-VRAM telemetry to guide extractor batch-size ramping (logs only)
+        import torch as _torch
+        if _torch.cuda.is_available():
+            _torch.cuda.reset_peak_memory_stats()
+    except Exception:
+        _torch = None
+    out = run_inference(model, mode, src_path, audio_only=audio_only)
+    try:
+        if _torch is not None and _torch.cuda.is_available():
+            logger.info("PEAK_VRAM_GB=%.2f", _torch.cuda.max_memory_allocated() / 1e9)
+    except Exception:
+        pass
+    return out
 
 
 # --- helpers ----------------------------------------------------------------

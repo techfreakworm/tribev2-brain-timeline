@@ -66,7 +66,22 @@ DEFAULT_MESH = "fsaverage5"
 #: with ``num_workers > 0`` (the shipped config uses 20) raises
 #: ``AssertionError: daemonic processes are not allowed to have children``.
 #: Force single-process data loading inside the ``@spaces.GPU`` worker.
-CONFIG_UPDATE: dict[str, int] = {"data.overlap_trs_train": 20, "data.num_workers": 0}
+CONFIG_UPDATE: dict[str, int] = {
+    "data.overlap_trs_train": 20,
+    "data.num_workers": 0,
+    # Perf: the dominant cost is per-modality backbone feature extraction
+    # (V-JEPA2 -> W2V-BERT -> LLaMA, loaded->extract->freed one at a time) at
+    # small batch sizes, which underuses ZeroGPU's ~48 GB (RTX Pro 6000
+    # Blackwell). Raise the heavy extractors' batch sizes to exploit the idle
+    # VRAM. video_feature.image = V-JEPA2-ViT-g (heaviest; #1 win, was 8);
+    # text_feature = LLaMA-3.2-3B (was 4); data.batch_size = the small head
+    # (near-free). audio_feature has no batch knob; image_feature/DINOv2 is
+    # inactive (features_to_use = [text, audio, video]). Throughput-only --
+    # outputs/stitch/normalization are unchanged. Ramp empirically if VRAM allows.
+    "data.video_feature.image.batch_size": 16,
+    "data.text_feature.batch_size": 16,
+    "data.batch_size": 16,
+}
 
 #: Valid ``mode`` values accepted by :func:`run_inference`. These map onto the
 #: ``{mode}_path`` keyword of ``TribeModel.get_events_dataframe``.
