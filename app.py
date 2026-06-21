@@ -142,11 +142,16 @@ def _gpu_infer(mode: str, src_path: str, audio_only: bool):
             _torch.cuda.reset_peak_memory_stats()
     except Exception:
         _torch = None
-    # NOTE: a blanket bf16 autocast here sped the encode ~2.3x BUT made the model
-    # OUTPUT bf16, which broke tribev2's internal `.numpy()` (numpy has no
-    # bfloat16) -> "unsupported ScalarType BFloat16". bf16 must live INSIDE the
-    # encode loop (neuralset fork, Phase 2), casting features back to fp32 before
-    # they're converted to numpy/cached. Plain fp32 here (TF32 still on).
+    # Scoped bf16 on the V-JEPA2 encode loop (the bottleneck): a monkeypatch wraps
+    # _HFVideoModel.predict_hidden_states in bf16 autocast and returns fp32 hidden
+    # states -> ~2x faster encode with NO numpy break (a blanket autocast here
+    # previously made outputs bf16 and broke tribev2's internal .numpy()).
+    # V-JEPA2 only; audio/text/head stay fp32. TF32 also on.
+    try:
+        from tribescore.patches import apply_bf16_video_encode
+        apply_bf16_video_encode()
+    except Exception:
+        pass
     out = run_inference(model, mode, src_path, audio_only=audio_only)
     try:
         if _torch is not None and _torch.cuda.is_available():
