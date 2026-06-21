@@ -28,3 +28,13 @@ spaces
 nilearn
 plotly
 numpy
+
+# --- ROI atlas (HCP-MMP1 / Glasser via MNE) + smoothing + whisperx runner ----
+# mne   : ships the HCP-MMP1 parcellation used for ROI->metric reduction
+#         (tribev2/utils.py:get_hcp_roi_indices); fetches the annot once at runtime.
+# scipy : gaussian_filter1d for metric-curve smoothing (also via tribev2[plotting]).
+# uv    : provides `uvx`, which tribev2's ExtractWordsFromAudio shells out to for
+#         whisperx ASR (eventstransforms.py). Must be on PATH on the Space.
+mne
+scipy
+uv

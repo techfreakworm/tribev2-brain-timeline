@@ -9,6 +9,8 @@ python_version: '3.12'
 app_file: app.py
 pinned: false
 license: apache-2.0
+suggested_hardware: zero-a10g
+hf_oauth: false
 ---
 
 # TRIBE v2 Video Brain-Score 🧠
