@@ -1,0 +1,30 @@
+# =============================================================================
+# Runtime dependencies for the TRIBE v2 Video Brain-Score Space.
+#
+# These resolve and install on the Hugging Face ZeroGPU Space, NOT on a local
+# CPU box. The `tribev2` extra pulls a large stack (torch, transformers,
+# nilearn, V-JEPA2 / Wav2Vec-BERT / DINOv2 / LLaMA encoders) and downloads
+# model weights at runtime. Do not attempt to install or run this locally.
+#
+# Versions are pinned to the proven cbensimon/tribe-v2-demo reference Space.
+# =============================================================================
+
+# --- TRIBE v2 model + its plotting extra (brain-mesh rendering) --------------
+# Installed straight from the upstream GitHub repo, as in the reference Space.
+tribev2[plotting] @ git+https://github.com/facebookresearch/tribev2.git
+
+# --- Torch: pinned to the version the reference Space is proven against ------
+torch==2.6.0
+
+# --- Gradio UI: pinned to the README front-matter sdk_version ----------------
+gradio==6.11.0
+
+# --- Hugging Face ZeroGPU runtime decorator (@spaces.GPU) --------------------
+spaces
+
+# --- Neuro / numeric stack used for ROI reduction & plotting ----------------
+# (nilearn is also pulled transitively by tribev2[plotting]; pinned-by-absence
+#  here so the Space resolver picks a compatible version.)
+nilearn
+plotly
+numpy

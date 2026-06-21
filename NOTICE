@@ -1,0 +1,66 @@
+TRIBE v2 Video Brain-Score
+Copyright 2026 TRIBE v2 Video Brain-Score contributors
+
+This product includes software developed by the
+TRIBE v2 Video Brain-Score contributors.
+
+The source code in this repository (the Gradio app, the `tribescore`
+package, tests, and configuration) is licensed under the Apache License,
+Version 2.0. See the LICENSE file for the full text.
+
+================================================================================
+IMPORTANT: NON-COMMERCIAL RESEARCH DEMO
+================================================================================
+
+This application is a NON-COMMERCIAL research demonstration. It does not
+redistribute any model weights; weights are downloaded at runtime, on the
+Hugging Face Space, directly from their respective upstream repositories.
+
+The application wraps `facebook/tribev2` and, transitively, several
+foundation models. Each carries its own license, and the most restrictive
+of these governs how the *combined* system may be used. The TRIBE v2
+weights are released under a NON-COMMERCIAL license; therefore this demo,
+and any use of its predictions, is restricted to non-commercial research
+and evaluation purposes.
+
+--------------------------------------------------------------------------------
+Third-party models and their licenses
+--------------------------------------------------------------------------------
+
+1. TRIBE v2  (facebook/tribev2)
+   - Model weights: Creative Commons Attribution-NonCommercial 4.0
+     International (CC-BY-NC-4.0).
+   - NON-COMMERCIAL use only. Attribution required.
+   - https://huggingface.co/facebook/tribev2
+   - Source code: https://github.com/facebookresearch/tribev2
+
+2. LLaMA 3.2 3B  (used by TRIBE v2 as a text encoder)
+   - Llama 3.2 Community License Agreement.
+   - https://huggingface.co/meta-llama/Llama-3.2-3B
+   - https://www.llama.com/llama3_2/license/
+
+3. V-JEPA 2  (Meta — used by TRIBE v2 as a video encoder)
+   - Released by Meta under its accompanying model license; see the model
+     card for the authoritative terms.
+   - https://huggingface.co/facebook/vjepa2-vitg-fpc64-256
+
+4. Wav2Vec2-BERT  (used by TRIBE v2 as an audio/speech encoder)
+   - See the upstream model card for the authoritative license terms.
+   - https://huggingface.co/facebook/w2v-bert-2.0
+
+5. DINOv2  (Meta — used by TRIBE v2 as an image encoder)
+   - Apache License 2.0.
+   - https://huggingface.co/facebook/dinov2-base
+   - https://github.com/facebookresearch/dinov2
+
+--------------------------------------------------------------------------------
+Notes
+--------------------------------------------------------------------------------
+
+* The license summaries above are provided for convenience only and are NOT
+  legal advice. Always consult each model's official license and model card
+  for the authoritative and current terms before any use.
+* The "brain-metric" curves (attention, virality, engagement) produced by
+  this app are DERIVED, heuristic interpretations of predicted fMRI-like
+  brain activity. They are exploratory and are not validated clinical,
+  neuroscientific, or commercial measurements. See README.md.

@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tribescore"
+version = "0.1.0"
+description = "Derive brain-metric curves (attention, virality, engagement) from a video using TRIBE v2."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+authors = [{ name = "TRIBE v2 Video Brain-Score contributors" }]
+keywords = ["fmri", "tribev2", "brain", "video", "gradio", "huggingface"]
+
+# The heavy runtime stack (tribev2, torch, gradio, ...) is pinned in
+# requirements.txt and installed on the Hugging Face Space. The package itself
+# only needs numpy to import; model/UI deps are intentionally NOT hard
+# dependencies so `import tribescore` stays light and CI-friendly.
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+# Test-only deps. The model is never exercised in tests (synthetic infer_fn).
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+# Resolve `import tribescore` from the src/ layout without an editable install.
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q"
