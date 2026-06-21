@@ -11,6 +11,10 @@ pinned: false
 license: apache-2.0
 suggested_hardware: zero-a10g
 hf_oauth: false
+preload_from_hub:
+  - facebook/tribev2 best.ckpt,config.yaml
+  - facebook/vjepa2-vitg-fpc64-256 *.safetensors,*.json
+  - facebook/w2v-bert-2.0 *.safetensors,*.json
 ---
 
 # TRIBE v2 Video Brain-Score 🧠

@@ -133,9 +133,12 @@ def _gpu_infer(mode: str, src_path: str, audio_only: bool):
     """Run one whole-clip predict() on ZeroGPU. Everything else is CPU."""
     model = load_model(CACHE_DIR)  # singleton: instant after eager startup load
     _torch = None
-    try:  # peak-VRAM telemetry to guide extractor batch-size ramping (logs only)
+    try:  # TF32 fast matmul/conv (no result change) + peak-VRAM telemetry (logs)
         import torch as _torch
         if _torch.cuda.is_available():
+            _torch.backends.cuda.matmul.allow_tf32 = True
+            _torch.backends.cudnn.allow_tf32 = True
+            _torch.set_float32_matmul_precision("high")
             _torch.cuda.reset_peak_memory_stats()
     except Exception:
         _torch = None
