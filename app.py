@@ -54,7 +54,11 @@ logging.basicConfig(level=logging.INFO)
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 
 # --- constants --------------------------------------------------------------
-GPU_DURATION_S = 480          # ZeroGPU reservation per Run (§7; reference uses 480)
+GPU_DURATION_S = 900          # ZeroGPU reservation cap per Run. Bumped 480->900 to
+                              # cover the once-per-container torch.compile of V-JEPA2
+                              # (~2-4 min). ZeroGPU bills ACTUAL use, so warm calls
+                              # (~90 s) cost the same; the cap just avoids a first-run
+                              # timeout while the static graph compiles (§7).
 MAX_DURATION_S = 300          # 5 min hard cap (§11.3)
 MIN_USEFUL_S = 10             # advisory: clips shorter than this are degenerate
 MAX_TEXT_CHARS = 5000         # cap TTS length so text mode can't blow GPU time
@@ -90,6 +94,12 @@ CACHE_DIR = _resolve_cache_dir()
 # mne requires MNE_DATA to be an EXISTING directory, so create it up front.
 os.environ.setdefault("MNE_DATA", os.path.join(CACHE_DIR, "mne_data"))
 os.makedirs(os.environ["MNE_DATA"], exist_ok=True)
+# Route the TorchInductor (torch.compile) cache into CACHE_DIR. Within a container
+# this persists the compiled V-JEPA2 kernels across @spaces.GPU calls (warm calls
+# reload in seconds instead of recompiling); if CACHE_DIR resolved to persistent
+# /data it also survives cold starts. Harmless when CACHE_DIR is ephemeral.
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.join(CACHE_DIR, "inductor"))
+os.makedirs(os.environ["TORCHINDUCTOR_CACHE_DIR"], exist_ok=True)
 
 
 def _ensure_writable_hub() -> None:
@@ -176,13 +186,22 @@ def _gpu_infer(mode: str, src_path: str, audio_only: bool):
     # previously made outputs bf16 and broke tribev2's internal .numpy()).
     # V-JEPA2 only; audio/text/head stay fp32. TF32 also on.
     try:
-        # bf16 on the V-JEPA2 encode (~2.2x; the real win). Clip-batching
-        # (apply_batched_video_encode, kept in patches.py) is correctness-validated
-        # — metrics match bs=1 — but NOT a speedup here: ViT-g is compute-bound, so
-        # B=4 (~231s) was slower than per-clip bf16 (~173s) and B=8 OOMs 48GB.
-        # Left unused; bf16 is the encode win.
-        from tribescore.patches import apply_bf16_video_encode
+        # Two stacked encode wins on the compute-bound V-JEPA2 ViT-g (the
+        # bottleneck), both vjepa2-only, both correctness-safe (every metric is
+        # z-scored over time, so they add only float-order noise):
+        #   1. bf16 autocast on the encode forward (~2.2x).
+        #   2. torch.compile(dynamic=False) of that forward — every clip has an
+        #      identical shape, so one static AOTInductor graph (fused attention +
+        #      autotuned GEMMs) serves all ~104 clips. This is the right lever for
+        #      a compute-bound model; clip-BATCHING was a dead end (B=4 ~231s was
+        #      slower than per-clip bf16 ~173s, B=8 OOM'd 48GB) so it stays unused.
+        # torch.compile traces UNDER the bf16 autocast, so order is irrelevant.
+        from tribescore.patches import (
+            apply_bf16_video_encode,
+            apply_torchcompile_video_encode,
+        )
         apply_bf16_video_encode()
+        apply_torchcompile_video_encode()
     except Exception:
         pass
     out = run_inference(model, mode, src_path, audio_only=audio_only)

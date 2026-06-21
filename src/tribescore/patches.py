@@ -61,6 +61,65 @@ def apply_bf16_video_encode() -> bool:
     return True
 
 
+def apply_torchcompile_video_encode(
+    mode: str = "max-autotune-no-cudagraphs",
+) -> bool:
+    """JIT-compile the V-JEPA2 forward (the compute-bound bottleneck) on the Space.
+
+    The "Encoding video" loop calls the V-JEPA2 ``self.model(**inputs)`` once per
+    clip (~104x) with an **identical input shape every time** (fixed 64-frame
+    256x256 clip). That makes ``torch.compile(..., dynamic=False)`` ideal: it
+    compiles a single static graph on the first forward (inside ``@spaces.GPU``)
+    and every subsequent clip reuses it. AOTInductor fuses the attention and
+    autotunes the GEMMs — exactly where a compute-bound ViT-g spends its time — so
+    this is the right lever (batching was a dead end: ViT-g is compute-bound, B=4
+    was *slower* than per-clip bf16, B=8 OOM'd 48 GB).
+
+    Composition: traces *under* the bf16 autocast wrapper
+    (``apply_bf16_video_encode`` stays on — the compiled graph captures the
+    autocast region) and TF32. Same math; bf16 + fused/flash kernels add only
+    float-order noise (every metric is z-scored over time), so curves match the
+    bs=1 baseline.
+
+    vjepa2 only; other backbones (W2V-BERT, LLaMA) are untouched. Robust: a
+    compile-setup failure falls back to eager, and ``fullgraph=False`` lets
+    ``torch.compile`` self-degrade on any graph break instead of erroring.
+    Idempotent; first-forward compile is cached on disk (see
+    ``TORCHINDUCTOR_CACHE_DIR``) so only the first inference per container pays it.
+    """
+    try:
+        import torch
+        from neuralset.extractors import video as nsv
+    except Exception as exc:  # neuralset/torch absent (e.g. local) -> skip
+        logger.warning(
+            "torch.compile video-encode patch skipped (deps unavailable): %r", exc
+        )
+        return False
+
+    cls = nsv._HFVideoModel
+    if getattr(cls, "_tribescore_compiled", False):
+        return True
+    _orig_init = cls.__init__
+
+    def _init(self, *args, **kwargs):  # noqa: ANN001 - mirror upstream sig
+        _orig_init(self, *args, **kwargs)
+        try:
+            if "vjepa2" in self.model_name and torch.cuda.is_available():
+                self.model.forward = torch.compile(
+                    self.model.forward, mode=mode, dynamic=False, fullgraph=False
+                )
+                logger.info(
+                    "torch.compile applied to V-JEPA2 forward (mode=%s)", mode
+                )
+        except Exception as exc:  # never break construction -> stay eager
+            logger.warning("torch.compile setup failed (%r); eager forward", exc)
+
+    cls.__init__ = _init
+    cls._tribescore_compiled = True
+    logger.info("installed torch.compile V-JEPA2 init hook (mode=%s)", mode)
+    return True
+
+
 def apply_batched_video_encode(batch_size: int = 8) -> bool:
     """Batch the V-JEPA2 "Encoding video" loop (vjepa2 only) for ~3-8x.
 
