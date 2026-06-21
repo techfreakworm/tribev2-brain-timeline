@@ -61,7 +61,12 @@ DEFAULT_MESH = "fsaverage5"
 #: windows at an 80 s stride (``docs/PLAN.md`` §3/§4). ``data.duration_trs`` is
 #: deliberately NOT touched -- the checkpoint pooler locks the window at 100 s
 #: and changing it crashes ``predict()`` (§3, R8).
-CONFIG_UPDATE: dict[str, int] = {"data.overlap_trs_train": 20}
+#: ``data.num_workers = 0``: ZeroGPU runs the GPU function in a *daemonic*
+#: subprocess, and a daemon process cannot spawn children -- so a DataLoader
+#: with ``num_workers > 0`` (the shipped config uses 20) raises
+#: ``AssertionError: daemonic processes are not allowed to have children``.
+#: Force single-process data loading inside the ``@spaces.GPU`` worker.
+CONFIG_UPDATE: dict[str, int] = {"data.overlap_trs_train": 20, "data.num_workers": 0}
 
 #: Valid ``mode`` values accepted by :func:`run_inference`. These map onto the
 #: ``{mode}_path`` keyword of ``TribeModel.get_events_dataframe``.
