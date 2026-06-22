@@ -644,6 +644,12 @@ def profile_breakdown(video) -> str:
         if _af is not None:
             hook(type(_af), "_get_sound_model", "audio_build")
         hook(HuggingFaceAudio, "_process_wav", "audio_fwd")
+        # H2D timer: batch.to(device) is SegmentData.to (a plain method, ~1-2 calls
+        # -> no per-call artifact). Resolves loop_other into H2D (GPU, not movable)
+        # vs loader-PULL (CPU extraction-orchestration, movable outside @gpu = (b)).
+        from neuralset.dataloader import SegmentData
+
+        hook(SegmentData, "to", "h2d")
 
         _sync()
         t = time.perf_counter()
@@ -667,8 +673,10 @@ def profile_breakdown(video) -> str:
         hf = T.get("head_fwd", 0.0)      # RELIABLE head forward (instance hook)
         a_other = ae - ab - af           # wav read + feature-extract inside prepare
         assembly = gl - ve - ae
+        h2d = T.get("h2d", 0.0)          # batch.to(device) GPU transfer
         loop = total - ev - gl           # the predict `for batch in loader` loop
-        loop_other = loop - hf           # H2D (batch.to) + per-TR segmentation + loader windowing/collation
+        loop_other = loop - hf           # everything but the head forward
+        pull = loop_other - h2d          # loader-PULL: lazy extraction-orchestration (CPU) + segment-copy
         vbuild = vt.get("backbone_build_s", 0.0)  # ~0 when prewarm hit
 
         def pct(v):
@@ -689,7 +697,8 @@ def profile_breakdown(video) -> str:
             f"   |- assembly + model loads           : {assembly:7.1f}s ({pct(assembly)})",
             f"★ predict LOOP (total-events-get_loaders): {loop:7.1f}s ({pct(loop)})  <- the '11s other'",
             f"   |- head forward (FmriEncoder, GPU)   : {hf:7.1f}s ({pct(hf)})",
-            f"   |- loop_other (H2D + segment + window): {loop_other:7.1f}s ({pct(loop_other)})",
+            f"   |- batch.to / H2D (GPU, NOT movable) : {h2d:7.1f}s ({pct(h2d)})",
+            f"   |- loader-PULL (extract-orch, CPU)   : {pull:7.1f}s ({pct(pull)})  <- if BIG -> (b) movable outside @gpu",
             f"--- video_extract internals (decode/proc/fwd) ---",
             f"   {vt}",
         ])
