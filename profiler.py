@@ -574,7 +574,7 @@ def profile_breakdown(video) -> str:
         clip = "/tmp/break_clip.mp4"
         subprocess.run(
             ["ffmpeg", "-y", "-i", video, "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono",
-             "-map", "0:v:0", "-map", "1:a:0", "-t", "45", "-c:v", "copy", "-c:a", "aac",
+             "-map", "0:v:0", "-map", "1:a:0", "-t", "60", "-c:v", "copy", "-c:a", "aac",
              "-shortest", clip],
             capture_output=True, check=True,
         )
@@ -624,6 +624,13 @@ def profile_breakdown(video) -> str:
         hook(HuggingFaceVideo, "prepare", "video_extract")
         hook(HuggingFaceAudio, "prepare", "audio_extract")
         hook(type(model._model), "forward", "head")
+        # Split the W2V-BERT BUILD/LOAD (lazy from_pretrained, ~2.3 GB, NOT
+        # prewarmed) from its FORWARD — tribe-brain's leading hypothesis for the
+        # billed "11s other". _get_sound_model is the build; _process_wav the fwd.
+        _af = model.data.audio_feature
+        if _af is not None:
+            hook(type(_af), "_get_sound_model", "audio_build")
+        hook(HuggingFaceAudio, "_process_wav", "audio_fwd")
 
         _sync()
         t = time.perf_counter()
@@ -639,22 +646,32 @@ def profile_breakdown(video) -> str:
         gl = T.get("get_loaders", 0.0)
         ve = T.get("video_extract", 0.0)
         ae = T.get("audio_extract", 0.0)
+        ab = T.get("audio_build", 0.0)   # W2V-BERT from_pretrained (NOT prewarmed)
+        af = T.get("audio_fwd", 0.0)     # W2V-BERT forward
         ev = T.get("events", 0.0)
         hd = T.get("head", 0.0)
+        a_other = ae - ab - af           # wav read + feature-extract inside prepare
         assembly = gl - ve - ae
         remainder = total - ev - gl - hd
+        vbuild = vt.get("backbone_build_s", 0.0)  # ~0 when prewarm hit
 
         def pct(v):
             return f"{100*v/max(total,1e-6):4.0f}%"
 
         return "\n".join([
-            "### CLEAN BREAKDOWN (uploaded real clip, first 45s, large, coarse timers)",
+            "### CLEAN BREAKDOWN (uploaded real clip, first 60s, large, coarse timers)",
             f"clip[w,h,frames,dur]={meta} | TRs={len(at)} | TOTAL run_inference={total:.1f}s",
+            "ALL stages below are BILLED (inside @spaces.GPU); stitch/metrics/plot run "
+            "in _score_impl AFTER this -> FREE, not shown.",
             "--- top-level stages of run_inference ---",
             f"events  (_build_audio_only_events, CPU): {ev:7.1f}s ({pct(ev)})",
             f"get_loaders (extract + assemble)       : {gl:7.1f}s ({pct(gl)})",
             f"   |- video_extract (V-JEPA2)          : {ve:7.1f}s ({pct(ve)})",
+            f"   |    V-JEPA2 build/load (prewarmed)  : {vbuild:7.1f}s   (hit={vt.get('backbone_hit')})",
             f"   |- audio_extract (W2V-BERT)         : {ae:7.1f}s ({pct(ae)})",
+            f"   |    W2V-BERT build/load (NOT prewarmed): {ab:7.1f}s ({pct(ab)})  <- tribe-brain hypothesis",
+            f"   |    W2V-BERT forward                : {af:7.1f}s ({pct(af)})",
+            f"   |    audio wav-read + featextract    : {a_other:7.1f}s ({pct(a_other)})",
             f"   |- assembly + model loads           : {assembly:7.1f}s ({pct(assembly)})",
             f"head loop (FmriEncoder.forward, GPU)   : {hd:7.1f}s ({pct(hd)})",
             f"remainder (abs_times+numpy+orch)       : {remainder:7.1f}s ({pct(remainder)})",
