@@ -21,6 +21,11 @@ import sys
 import tempfile
 from pathlib import Path
 
+# Local Apple-silicon: let any op without an MPS kernel fall back to CPU instead
+# of raising. PyTorch reads this at ``import torch``, so it MUST be set before the
+# (lazy) torch import inside ``load_model``. No-op on CUDA/ZeroGPU.
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
 # src-layout: the local ``tribescore`` package lives under ``src/``. HF Spaces
 # runs this file from the repo root with no editable install, so make the
 # package importable by putting ``<repo>/src`` on the path before importing it.
@@ -28,6 +33,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src
 
 import gradio as gr
 
+import profiler  # temporary ZeroGPU step-1 profiling harness
 import theme
 import ui
 from tribescore import __version__
@@ -141,11 +147,21 @@ def _get_masks():
 # qwen). Building the model only downloads the 708 MB ckpt — backbones load
 # lazily inside predict() — so this is safe even if a backbone gate were closed.
 if on_spaces():
+    _startup_model = None
     try:
-        load_model(CACHE_DIR)
+        _startup_model = load_model(CACHE_DIR)
         logger.info("eager model load complete at startup")
     except Exception as exc:  # non-fatal: first Run retries + surfaces the error
         logger.warning("eager model load failed (will retry on first run): %r", exc)
+    # Pre-warm OUTSIDE @spaces.GPU (not billed) so no Score triggers a download
+    # or a heavy build: ROI/HCP atlas always; the V-JEPA2 backbone (un-bills the
+    # per-Score from_pretrained) when the model loaded; Llama/whisperx/spacy if
+    # PREWARM_QUALITY.
+    try:
+        from tribescore.prewarm import prewarm_all
+        prewarm_all(CACHE_DIR, model=_startup_model)
+    except Exception as exc:
+        logger.warning("startup pre-warm failed (assets download on first use): %r", exc)
 
 
 # --- GPU-timed inference (only the model forward is on the GPU clock) --------
@@ -185,7 +201,25 @@ def _gpu_infer(mode: str, src_path: str, audio_only: bool):
         apply_bf16_video_encode()
     except Exception:
         pass
+    # Frame-dedup encode: decode+process each UNIQUE frame once, numerically exact
+    # (GPU-validated max|Δ|=0, keystone intact). ALSO the vehicle for backbone-reuse
+    # (build_video_model) — it reuses the startup-built CPU V-JEPA2 backbone and only
+    # pays .to(cuda) per fork, un-billing the per-Score ~7.6 GB from_pretrained.
+    # ON by default; opt out with TRIBE_NO_DEDUP=1 (A/B parity). Falls back to the
+    # native exca path on ANY error.
+    if not os.environ.get("TRIBE_NO_DEDUP"):
+        try:
+            from tribescore.fast_encode import apply_frame_dedup_encode
+            apply_frame_dedup_encode()
+        except Exception:
+            pass
     out = run_inference(model, mode, src_path, audio_only=audio_only)
+    try:  # backbone_hit=True proves the fork reused the startup-built backbone
+        from tribescore.fast_encode import LAST_TIMING
+        if LAST_TIMING:
+            logger.info("ENCODE_TIMING=%r", dict(LAST_TIMING))
+    except Exception:
+        pass
     try:
         if _torch is not None and _torch.cuda.is_available():
             logger.info("PEAK_VRAM_GB=%.2f", _torch.cuda.max_memory_allocated() / 1e9)
@@ -255,7 +289,14 @@ def _enter_loading():
 
 
 def _ok(media, fig, summary_html_str):
-    """Success update tuple for [empty, loading, error, result_grp, media, timeline, summary]."""
+    """Success update tuple for [empty, loading, error, result_grp, media, timeline, summary, ok].
+
+    The trailing ``True`` flows to :func:`_reveal_result` in a follow-up step:
+    Gradio 6.11 drops a container's ``visible=True`` update when the SAME
+    response also updates that container's children's values (here the timeline
+    Plot + summary), so the result group's reveal is applied separately where it
+    reliably sticks. The ``visible=True`` below is kept as a harmless best-effort.
+    """
     return (
         gr.update(visible=False),
         gr.update(visible=False),
@@ -264,11 +305,19 @@ def _ok(media, fig, summary_html_str):
         gr.update(value=media),
         gr.update(value=fig),
         gr.update(value=summary_html_str),
+        True,
     )
 
 
+def _reveal_result(ok: bool):
+    """Authoritatively toggle the result group's visibility in a standalone
+    response (decoupled from the value updates, so the Gradio 6.11 drop above
+    doesn't apply). ``ok`` is the success flag carried by a ``gr.State``."""
+    return gr.update(visible=bool(ok))
+
+
 def _fail(message: str):
-    """Error update tuple (same 7 outputs)."""
+    """Error update tuple (same 7 outputs + trailing ok=False for _reveal_result)."""
     return (
         gr.update(visible=False),
         gr.update(visible=False),
@@ -277,6 +326,7 @@ def _fail(message: str):
         gr.update(),
         gr.update(),
         gr.update(),
+        False,
     )
 
 
@@ -373,6 +423,10 @@ def build_demo() -> gr.Blocks:
             '<div class="co-status-dot">in-silico neuroscience</div>'
             "</div>"
         )
+
+        # Temporary step-1 profiling harness (compute-bound + large vs xlarge).
+        profiler.build_profiler()
+
         if on_spaces():
             gr.HTML(
                 '<div class="co-quota">⚡ Runs on <strong>ZeroGPU</strong> — each '
@@ -404,6 +458,10 @@ def build_demo() -> gr.Blocks:
 
         result_outputs = [r[k] for k in _RESULT_OUTPUTS_KEYS]
         loading_outputs = [r["empty"], r["loading"], r["error"], r["result_grp"]]
+        # Carries _score_impl's success flag to _reveal_result (the standalone
+        # visibility step that works around the Gradio 6.11 container-visibility drop).
+        ok_state = gr.State(False)
+        score_outputs = result_outputs + [ok_state]
         js_seek = seek_js()
 
         # Sample clip → fill the Video component.
@@ -413,15 +471,15 @@ def build_demo() -> gr.Blocks:
         v["run_btn"].click(_enter_loading, None, loading_outputs).then(
             lambda vid, metrics, ao, pr=gr.Progress(): _score_impl("video", vid, metrics, ao, pr),
             inputs=[v["video"], v["metrics"], v["audio_only"]],
-            outputs=result_outputs,
-        ).then(fn=None, js=js_seek)
+            outputs=score_outputs,
+        ).then(_reveal_result, inputs=[ok_state], outputs=[r["result_grp"]]).then(fn=None, js=js_seek)
 
         # --- Audio ---
         a["run_btn"].click(_enter_loading, None, loading_outputs).then(
             lambda aud, metrics, ao, pr=gr.Progress(): _score_impl("audio", aud, metrics, ao, pr),
             inputs=[a["audio"], a["metrics"], a["audio_only"]],
-            outputs=result_outputs,
-        ).then(fn=None, js=js_seek)
+            outputs=score_outputs,
+        ).then(_reveal_result, inputs=[ok_state], outputs=[r["result_grp"]]).then(fn=None, js=js_seek)
 
         # --- Text ---
         t["run_btn"].click(_enter_loading, None, loading_outputs).then(
@@ -429,8 +487,8 @@ def build_demo() -> gr.Blocks:
                 "text", _text_to_tmp(txt[:MAX_TEXT_CHARS]) if txt else "", metrics, False, pr
             ),
             inputs=[t["text"], t["metrics"]],
-            outputs=result_outputs,
-        ).then(fn=None, js=js_seek)
+            outputs=score_outputs,
+        ).then(_reveal_result, inputs=[ok_state], outputs=[r["result_grp"]]).then(fn=None, js=js_seek)
 
     return demo
 

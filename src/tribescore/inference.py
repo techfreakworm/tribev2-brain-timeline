@@ -83,6 +83,21 @@ CONFIG_UPDATE: dict[str, int] = {
     "data.batch_size": 16,
 }
 
+#: Local Apple-silicon (MPS) loader override. The raised extractor batch sizes
+#: above are CUDA/ZeroGPU-tuned and inert-to-counterproductive on MPS (the
+#: V-JEPA2 encode loop is hardcoded ``batch=1`` unless the CUDA-gated batched
+#: patch applies — it does not on MPS — and the text batch is moot in Fast
+#: mode), so locally we keep ONLY the two load-bearing knobs: ``overlap_trs_train
+#: = 20`` (locks the overlapping 100 s / 80 s windowing the stitch keystone
+#: depends on) and ``num_workers = 0`` (single-process loading; avoids macOS
+#: fork/spawn DataLoader quirks). ``data.batch_size`` falls back to the shipped
+#: default. Batch size cannot perturb segment/abs-time structure, so this is
+#: keystone-safe.
+LOCAL_CONFIG_UPDATE: dict[str, int] = {
+    "data.overlap_trs_train": 20,
+    "data.num_workers": 0,
+}
+
 #: Valid ``mode`` values accepted by :func:`run_inference`. These map onto the
 #: ``{mode}_path`` keyword of ``TribeModel.get_events_dataframe``.
 VALID_MODES: tuple[str, ...] = ("video", "audio", "text")
@@ -166,7 +181,9 @@ def assert_model_runtime() -> None:
 # ---------------------------------------------------------------------------
 
 
-def load_model(cache_dir: str, *, model_id: str = DEFAULT_MODEL_ID) -> Any:
+def load_model(
+    cache_dir: str, *, model_id: str = DEFAULT_MODEL_ID, device: str | None = None
+) -> Any:
     """Load the TRIBE v2 model from the Hub once and cache it (Space-only).
 
     Implements ``docs/PLAN.md`` §9 T-A. Lazily imports ``tribev2`` and returns
@@ -208,14 +225,28 @@ def load_model(cache_dir: str, *, model_id: str = DEFAULT_MODEL_ID) -> Any:
 
     assert_model_runtime()
 
+    # Local Apple-silicon: route the HF backbones (V-JEPA2 / W2V-BERT / Llama)
+    # and the brain head to MPS. ``enable_mps`` monkeypatches neuralset's
+    # ``device="auto"`` resolution (cpu -> mps) and ``head_device()`` returns
+    # ``"mps"``; BOTH are no-ops off Apple-silicon (head_device() -> "auto",
+    # enable_mps() returns False), so the ZeroGPU Space path is unchanged.
+    from tribescore.mps import enable_mps, head_device, mps_available
+
+    local = enable_mps()  # True on Apple-silicon (or TRIBE_FORCE_CPU); no-op on Space
+    if device is None:
+        device = head_device()
+    # On Apple-silicon use the lean local loader config (D4); the Space keeps the
+    # CUDA-tuned batch sizes. ``local`` also covers the TRIBE_FORCE_CPU debug path.
+    config = LOCAL_CONFIG_UPDATE if (local or mps_available()) else CONFIG_UPDATE
+
     # Deferred import: the heavy stack is touched only here, only on the Space.
     from tribev2 import TribeModel
 
     _MODEL = TribeModel.from_pretrained(
         model_id,
         cache_folder=str(cache_dir),
-        device="auto",
-        config_update=dict(CONFIG_UPDATE),
+        device=device,
+        config_update=dict(config),
     )
     return _MODEL
 

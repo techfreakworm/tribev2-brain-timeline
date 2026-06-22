@@ -20,6 +20,15 @@ tribev2[plotting] @ git+https://github.com/techfreakworm/tribev2.git
 torch==2.8.0
 torchvision==0.23.0
 
+# --- Transformers: cap below the 5.0 major break --------------------------
+# tribev2/neuralset's V-JEPA2 + Wav2Vec2-BERT extractors were authored against
+# the 4.5x line (V-JEPA2 landed in 4.53). transformers 5.x relocates the
+# V-JEPA2 video-processor module path and can silently drift the extractor I/O.
+# The fork leaves this UNPINNED, so a fresh install otherwise grabs 5.x — pin
+# below 5.0 for a reproducible, proven backbone API (matches the era the
+# reference Space resolved at build time).
+transformers>=4.53,<5
+
 # --- Gradio UI: pinned to the README front-matter sdk_version ----------------
 gradio==6.11.0
 
