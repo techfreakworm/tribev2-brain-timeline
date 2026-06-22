@@ -536,7 +536,7 @@ def profile_full() -> str:
 
 
 @_gpu_pipe  # duration=240, size large
-def profile_breakdown(video) -> str:
+def profile_breakdown(video, use_dedup=True, keep_in_ram=False) -> str:
     """CLEAN coarse-timer breakdown of run_inference on an UPLOADED real clip.
 
     The fix for profile_full's lie: NO per-frame hooks (those inflated decode via
@@ -566,7 +566,13 @@ def profile_breakdown(video) -> str:
         from tribescore import fast_encode
         from tribescore import inference as tsi
 
-        fast_encode.apply_frame_dedup_encode()
+        # A/B levers to pin the 59s loop mechanism:
+        #  use_dedup=False -> native exca path (the loop can RETRIEVE from cache);
+        #  if loop shrinks vs dedup-on -> the dedup's exca-bypass was forcing re-extraction.
+        if use_dedup:
+            fast_encode.apply_frame_dedup_encode()
+        else:
+            fast_encode.remove_frame_dedup_encode()
         from neuralset.extractors.audio import HuggingFaceAudio
         from neuralset.extractors.video import HuggingFaceVideo
         from tribescore.inference import load_model, run_inference
@@ -587,6 +593,20 @@ def profile_breakdown(video) -> str:
         cache = "/tmp/profcache"
         os.makedirs(cache, exist_ok=True)
         model = load_model(cache)
+
+        # keep_in_ram lever: if the loop is exca disk re-reads, this erases it.
+        kir = "off"
+        if keep_in_ram:
+            done = []
+            for nm, ext in (("video", model.data.video_feature), ("audio", model.data.audio_feature)):
+                inf = getattr(ext, "infra", None)
+                if inf is not None:
+                    try:
+                        object.__setattr__(inf, "keep_in_ram", True)
+                        done.append(nm)
+                    except Exception:
+                        done.append(f"{nm}:FAIL")
+            kir = ",".join(done) or "no-infra"
 
         T: dict = {}
         saved = []
@@ -683,7 +703,7 @@ def profile_breakdown(video) -> str:
             return f"{100*v/max(total,1e-6):4.0f}%"
 
         return "\n".join([
-            "### CLEAN BREAKDOWN v2 (real clip, first 60s, large; RELIABLE head hook)",
+            f"### BREAKDOWN (real clip 60s, large | dedup={use_dedup} keep_in_ram={kir})",
             f"clip[w,h,frames,dur]={meta} | TRs={len(at)} | TOTAL run_inference={total:.1f}s",
             "ALL stages BILLED (inside @spaces.GPU); stitch/metrics/plot are FREE in _score_impl after.",
             "--- top-level stages of run_inference ---",
@@ -722,6 +742,8 @@ def build_profiler():
             b_full = gr.Button("★ Profile · FULL pipeline breakdown")
         with gr.Row():
             clip_in = gr.File(label="real clip for CLEAN breakdown", type="filepath")
+            cb_dedup = gr.Checkbox(label="apply dedup", value=True)
+            cb_kir = gr.Checkbox(label="keep_in_ram", value=False)
             b_break = gr.Button("★★ Profile · CLEAN breakdown (upload real clip)")
         b_large.click(profile_large, inputs=None, outputs=out, api_name="profile_large")
         b_xlarge.click(profile_xlarge, inputs=None, outputs=out, api_name="profile_xlarge")
@@ -729,5 +751,5 @@ def build_profiler():
         b_bill.click(billing_probe, inputs=None, outputs=out, api_name="billing_probe")
         b_dedup.click(profile_validate_dedup, inputs=None, outputs=out, api_name="validate_dedup")
         b_full.click(profile_full, inputs=None, outputs=out, api_name="profile_full")
-        b_break.click(profile_breakdown, inputs=clip_in, outputs=out, api_name="profile_breakdown")
+        b_break.click(profile_breakdown, inputs=[clip_in, cb_dedup, cb_kir], outputs=out, api_name="profile_breakdown")
     return out
