@@ -623,10 +623,23 @@ def profile_breakdown(video) -> str:
         hook(type(model.data), "get_loaders", "get_loaders")
         hook(HuggingFaceVideo, "prepare", "video_extract")
         hook(HuggingFaceAudio, "prepare", "audio_extract")
-        hook(type(model._model), "forward", "head")
+        # RELIABLE head timing: nn.Module instance hooks (the forward-METHOD patch
+        # caught 0.0s — the head is invoked via a path that bypassed it). These
+        # fire on every model._model(batch) regardless of how __call__ resolves.
+        _hs = {}
+
+        def _head_pre(m, inp):
+            _sync()
+            _hs["t"] = time.perf_counter()
+
+        def _head_post(m, inp, out):
+            _sync()
+            T["head_fwd"] = T.get("head_fwd", 0.0) + (time.perf_counter() - _hs.get("t", time.perf_counter()))
+
+        _hh = [model._model.register_forward_pre_hook(_head_pre),
+               model._model.register_forward_hook(_head_post)]
         # Split the W2V-BERT BUILD/LOAD (lazy from_pretrained, ~2.3 GB, NOT
-        # prewarmed) from its FORWARD — tribe-brain's leading hypothesis for the
-        # billed "11s other". _get_sound_model is the build; _process_wav the fwd.
+        # prewarmed) from its FORWARD — _get_sound_model is the build; _process_wav fwd.
         _af = model.data.audio_feature
         if _af is not None:
             hook(type(_af), "_get_sound_model", "audio_build")
@@ -641,6 +654,8 @@ def profile_breakdown(video) -> str:
         tsi._build_audio_only_events = _orig_ev
         for cls, name, orig in saved:
             setattr(cls, name, orig)
+        for h in _hh:
+            h.remove()
 
         vt = dict(fast_encode.LAST_TIMING)
         gl = T.get("get_loaders", 0.0)
@@ -649,32 +664,32 @@ def profile_breakdown(video) -> str:
         ab = T.get("audio_build", 0.0)   # W2V-BERT from_pretrained (NOT prewarmed)
         af = T.get("audio_fwd", 0.0)     # W2V-BERT forward
         ev = T.get("events", 0.0)
-        hd = T.get("head", 0.0)
+        hf = T.get("head_fwd", 0.0)      # RELIABLE head forward (instance hook)
         a_other = ae - ab - af           # wav read + feature-extract inside prepare
         assembly = gl - ve - ae
-        remainder = total - ev - gl - hd
+        loop = total - ev - gl           # the predict `for batch in loader` loop
+        loop_other = loop - hf           # H2D (batch.to) + per-TR segmentation + loader windowing/collation
         vbuild = vt.get("backbone_build_s", 0.0)  # ~0 when prewarm hit
 
         def pct(v):
             return f"{100*v/max(total,1e-6):4.0f}%"
 
         return "\n".join([
-            "### CLEAN BREAKDOWN (uploaded real clip, first 60s, large, coarse timers)",
+            "### CLEAN BREAKDOWN v2 (real clip, first 60s, large; RELIABLE head hook)",
             f"clip[w,h,frames,dur]={meta} | TRs={len(at)} | TOTAL run_inference={total:.1f}s",
-            "ALL stages below are BILLED (inside @spaces.GPU); stitch/metrics/plot run "
-            "in _score_impl AFTER this -> FREE, not shown.",
+            "ALL stages BILLED (inside @spaces.GPU); stitch/metrics/plot are FREE in _score_impl after.",
             "--- top-level stages of run_inference ---",
             f"events  (_build_audio_only_events, CPU): {ev:7.1f}s ({pct(ev)})",
             f"get_loaders (extract + assemble)       : {gl:7.1f}s ({pct(gl)})",
             f"   |- video_extract (V-JEPA2)          : {ve:7.1f}s ({pct(ve)})",
             f"   |    V-JEPA2 build/load (prewarmed)  : {vbuild:7.1f}s   (hit={vt.get('backbone_hit')})",
             f"   |- audio_extract (W2V-BERT)         : {ae:7.1f}s ({pct(ae)})",
-            f"   |    W2V-BERT build/load (NOT prewarmed): {ab:7.1f}s ({pct(ab)})  <- tribe-brain hypothesis",
-            f"   |    W2V-BERT forward                : {af:7.1f}s ({pct(af)})",
-            f"   |    audio wav-read + featextract    : {a_other:7.1f}s ({pct(a_other)})",
+            f"   |    W2V-BERT build/load            : {ab:7.1f}s ({pct(ab)})",
+            f"   |    W2V-BERT forward               : {af:7.1f}s ({pct(af)})",
             f"   |- assembly + model loads           : {assembly:7.1f}s ({pct(assembly)})",
-            f"head loop (FmriEncoder.forward, GPU)   : {hd:7.1f}s ({pct(hd)})",
-            f"remainder (abs_times+numpy+orch)       : {remainder:7.1f}s ({pct(remainder)})",
+            f"★ predict LOOP (total-events-get_loaders): {loop:7.1f}s ({pct(loop)})  <- the '11s other'",
+            f"   |- head forward (FmriEncoder, GPU)   : {hf:7.1f}s ({pct(hf)})",
+            f"   |- loop_other (H2D + segment + window): {loop_other:7.1f}s ({pct(loop_other)})",
             f"--- video_extract internals (decode/proc/fwd) ---",
             f"   {vt}",
         ])
