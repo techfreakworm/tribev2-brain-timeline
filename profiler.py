@@ -535,6 +535,136 @@ def profile_full() -> str:
         return "PROFILE_FULL FAILED:\n" + traceback.format_exc()
 
 
+@_gpu_pipe  # duration=240, size large
+def profile_breakdown(video) -> str:
+    """CLEAN coarse-timer breakdown of run_inference on an UPLOADED real clip.
+
+    The fix for profile_full's lie: NO per-frame hooks (those inflated decode via
+    1536 perf_counter+sync calls). Hooks only once-per-call boundaries —
+    _build_audio_only_events, Data.get_loaders, each extractor's prepare(), the head
+    FmriEncoder.forward — so the '11s other' decomposes cleanly. Trims to the first
+    45s + adds a silent track (the real clip is silent 1080p HEVC) via -c:v copy so
+    the prep is ~free, not a billed re-encode.
+    """
+    import os
+    import subprocess
+    import time
+    import traceback
+
+    import torch
+
+    try:
+        if not video:
+            return "no clip uploaded — use the file picker / pass a path via the API"
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.set_float32_matmul_precision("high")
+        from tribescore.patches import apply_bf16_video_encode
+
+        apply_bf16_video_encode()
+        from tribescore import fast_encode
+        from tribescore import inference as tsi
+
+        fast_encode.apply_frame_dedup_encode()
+        from neuralset.extractors.audio import HuggingFaceAudio
+        from neuralset.extractors.video import HuggingFaceVideo
+        from tribescore.inference import load_model, run_inference
+
+        clip = "/tmp/break_clip.mp4"
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", video, "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono",
+             "-map", "0:v:0", "-map", "1:a:0", "-t", "45", "-c:v", "copy", "-c:a", "aac",
+             "-shortest", clip],
+            capture_output=True, check=True,
+        )
+        meta = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+             "stream=width,height,nb_frames,duration", "-of", "csv=p=0", clip],
+            capture_output=True, text=True,
+        ).stdout.strip()
+
+        cache = "/tmp/profcache"
+        os.makedirs(cache, exist_ok=True)
+        model = load_model(cache)
+
+        T: dict = {}
+        saved = []
+
+        def _sync():
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+
+        def hook(cls, name, key):
+            orig = getattr(cls, name)
+
+            def w(self, *a, **k):
+                _sync()
+                t0 = time.perf_counter()
+                r = orig(self, *a, **k)
+                _sync()
+                T[key] = T.get(key, 0.0) + (time.perf_counter() - t0)
+                return r
+
+            setattr(cls, name, w)
+            saved.append((cls, name, orig))
+
+        # module-function hook for the audio_only event build
+        _orig_ev = tsi._build_audio_only_events
+
+        def _w_ev(*a, **k):
+            t0 = time.perf_counter()
+            r = _orig_ev(*a, **k)
+            T["events"] = T.get("events", 0.0) + (time.perf_counter() - t0)
+            return r
+
+        tsi._build_audio_only_events = _w_ev
+
+        hook(type(model.data), "get_loaders", "get_loaders")
+        hook(HuggingFaceVideo, "prepare", "video_extract")
+        hook(HuggingFaceAudio, "prepare", "audio_extract")
+        hook(type(model._model), "forward", "head")
+
+        _sync()
+        t = time.perf_counter()
+        preds, at = run_inference(model, "video", clip, audio_only=True)
+        _sync()
+        total = time.perf_counter() - t
+
+        tsi._build_audio_only_events = _orig_ev
+        for cls, name, orig in saved:
+            setattr(cls, name, orig)
+
+        vt = dict(fast_encode.LAST_TIMING)
+        gl = T.get("get_loaders", 0.0)
+        ve = T.get("video_extract", 0.0)
+        ae = T.get("audio_extract", 0.0)
+        ev = T.get("events", 0.0)
+        hd = T.get("head", 0.0)
+        assembly = gl - ve - ae
+        remainder = total - ev - gl - hd
+
+        def pct(v):
+            return f"{100*v/max(total,1e-6):4.0f}%"
+
+        return "\n".join([
+            "### CLEAN BREAKDOWN (uploaded real clip, first 45s, large, coarse timers)",
+            f"clip[w,h,frames,dur]={meta} | TRs={len(at)} | TOTAL run_inference={total:.1f}s",
+            "--- top-level stages of run_inference ---",
+            f"events  (_build_audio_only_events, CPU): {ev:7.1f}s ({pct(ev)})",
+            f"get_loaders (extract + assemble)       : {gl:7.1f}s ({pct(gl)})",
+            f"   |- video_extract (V-JEPA2)          : {ve:7.1f}s ({pct(ve)})",
+            f"   |- audio_extract (W2V-BERT)         : {ae:7.1f}s ({pct(ae)})",
+            f"   |- assembly + model loads           : {assembly:7.1f}s ({pct(assembly)})",
+            f"head loop (FmriEncoder.forward, GPU)   : {hd:7.1f}s ({pct(hd)})",
+            f"remainder (abs_times+numpy+orch)       : {remainder:7.1f}s ({pct(remainder)})",
+            f"--- video_extract internals (decode/proc/fwd) ---",
+            f"   {vt}",
+        ])
+    except Exception:
+        return "BREAKDOWN FAILED:\n" + traceback.format_exc()
+
+
 def build_profiler():
     """Wire a small profiler panel into the Space UI (temporary step-1 harness)."""
     import gradio as gr
@@ -549,10 +679,14 @@ def build_profiler():
             b_bill = gr.Button("Step-0 · billing sleep-test (idle 30s)")
             b_dedup = gr.Button("Validate · frame-dedup parity+speedup")
             b_full = gr.Button("★ Profile · FULL pipeline breakdown")
+        with gr.Row():
+            clip_in = gr.File(label="real clip for CLEAN breakdown", type="filepath")
+            b_break = gr.Button("★★ Profile · CLEAN breakdown (upload real clip)")
         b_large.click(profile_large, inputs=None, outputs=out, api_name="profile_large")
         b_xlarge.click(profile_xlarge, inputs=None, outputs=out, api_name="profile_xlarge")
         b_pipe.click(profile_pipeline, inputs=None, outputs=out, api_name="profile_pipeline")
         b_bill.click(billing_probe, inputs=None, outputs=out, api_name="billing_probe")
         b_dedup.click(profile_validate_dedup, inputs=None, outputs=out, api_name="validate_dedup")
         b_full.click(profile_full, inputs=None, outputs=out, api_name="profile_full")
+        b_break.click(profile_breakdown, inputs=clip_in, outputs=out, api_name="profile_breakdown")
     return out
