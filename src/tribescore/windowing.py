@@ -10,9 +10,10 @@ fully unit-testable core of that pipeline (``docs/PLAN.md`` §4):
   * :func:`plan_windows` -- the window spans, for the progress UI and the
     per-window ``ffmpeg`` *fallback*. Pure function, no model.
   * :func:`stitch` -- the real work: detect each window from ``abs_times``,
-    per-window per-vertex z-score, trapezoidal-crossfade overlap-add onto an
-    integer-second grid, leading warm-up suppression, and zero-weight-gap
-    interpolation. Pure numpy.
+    trapezoidal-crossfade overlap-add of the RAW per-window preds onto an
+    integer-second grid, leading warm-up suppression, zero-weight-gap
+    interpolation, then ONE global per-vertex z-score over the stitched
+    timeline (cross-window scale consistency). Pure numpy.
 
 The heavy ``predict()`` is injected as ``(preds, abs_times)`` (the seam tests
 exercise with synthetic ramps/sines), so nothing here imports torch or tribev2.
@@ -38,7 +39,8 @@ WIN_S: int = 100
 HOP_S: int = 80
 WARMUP_TRIM: int = 5
 
-#: Small epsilon for the per-window per-vertex z-score denominator (§4 step 3b).
+#: Small epsilon for the global per-vertex z-score denominator (keeps a constant
+#: vertex finite -- it maps to ~0 rather than dividing by a zero std).
 _ZSCORE_EPS: float = 1e-6
 
 
@@ -153,9 +155,7 @@ def stitch(
        begins wherever ``abs_times`` does not strictly increase (the backward
        jump at a seam, e.g. ``…, 98, 99, 80, 81, …``). Each window gets an index
        ``w`` and each row an intra-window position ``p`` (0-based).
-    b. **Per-window per-vertex z-score** over that window's rows:
-       ``(x - mean_t) / (std_t + 1e-6)``.
-    c. **Trapezoidal crossfade weights** (overlap ``= win_s - hop_s``): the
+    b. **Trapezoidal crossfade weights** (overlap ``= win_s - hop_s``): the
        leading edge ramps ``0→1`` over the first ``overlap`` rows, the trailing
        edge ramps ``1→0`` over the last ``overlap`` rows, ``=1`` between -- so
        overlapping windows blend with ``Σ weight ≈ 1`` (no low-SNR seam band).
@@ -164,12 +164,22 @@ def stitch(
        ``p = warmup_trim``). Window 0 keeps its leading rows (nothing earlier
        covers them); the final window keeps its trailing rows at weight 1 (its
        tail is the unique end-of-clip signal -- not ramped down).
-    d. **Overlap-add** onto the integer-second grid
+    c. **Overlap-add** the RAW per-window preds onto the integer-second grid
        ``t_axis = arange(0, ceil(max(abs_times)) + 1)``:
-       ``timeline[t] = Σ_w weight·zrow / Σ_w weight`` over all rows whose
-       ``round(abs_time) == t`` (the weighted mean *is* the crossfade).
-    e. **Zero-weight grid seconds** (all-suppressed gaps -- should not occur
+       ``timeline[t] = Σ_w weight·raw / Σ_w weight`` over all rows whose
+       ``round(abs_time) == t`` (the weighted mean *is* the crossfade). Stitching
+       the raw rows -- *not* per-window-z-scored rows -- keeps one common scale
+       across windows; the same overlap second is blended at the same scale on
+       both sides of a seam (no scale-mismatch step).
+    d. **Zero-weight grid seconds** (all-suppressed gaps -- should not occur
        with 20 s overlap > 5 TR trim) are linearly interpolated from neighbours.
+    e. **Global per-vertex z-score over the stitched timeline**:
+       ``(x - mean_t) / (std_t + 1e-6)`` along the time axis of the *whole* clip.
+       ONE scale for the entire timeline -> "activity" means the same everywhere
+       and genuine cross-window amplitude dynamics (calm vs active) are preserved
+       (a per-100 s-window z-score instead forces every window to unit variance,
+       erasing those dynamics and manufacturing the seam step). This matches the
+       model's per-run-z-scored training basis.
     f. Returns ``(timeline (T, K), t_axis (T,))``.
 
     Parameters
@@ -240,9 +250,6 @@ def stitch(
         if n_w == 0:
             continue
 
-        # (b) per-window per-vertex z-score over time.
-        zrows = _zscore_over_time(win_preds)
-
         # (c) trapezoidal crossfade weights + warm-up suppression.
         is_first = w == 0
         is_last = w == n_windows - 1
@@ -262,8 +269,9 @@ def stitch(
             continue
         b = bins[valid]
         wv = wts[valid]
-        # Scatter-add weighted rows and weights into the grid.
-        np.add.at(accum, b, zrows[valid] * wv[:, None])
+        # Scatter-add the RAW weighted rows and weights into the grid (the
+        # single global z-score is applied once, after stitching -- see (f)).
+        np.add.at(accum, b, win_preds[valid] * wv[:, None])
         np.add.at(weight_sum, b, wv)
 
     # (d) normalise the weighted sum → weighted mean (the crossfade). Bins with
@@ -275,6 +283,12 @@ def stitch(
     # (e) linearly interpolate any zero-weight grid seconds from neighbours.
     if not covered.all():
         timeline = _interp_uncovered(timeline, covered, t_axis)
+
+    # (f) ONE global per-vertex z-score over the full stitched timeline (replaces
+    # the old per-window z-score). One scale for the whole clip -> consistent
+    # cross-window "activity", no seam step; matches the model's per-run-z-scored
+    # training. Keystone (_segment_windows/abs_times) untouched.
+    timeline = _zscore_over_time(timeline)
 
     return timeline, t_axis
 
@@ -302,15 +316,16 @@ def _segment_windows(abs_times: np.ndarray) -> List[Tuple[int, int]]:
     return [(int(s), int(e)) for s, e in zip(starts, ends)]
 
 
-def _zscore_over_time(win_preds: np.ndarray) -> np.ndarray:
-    """Per-vertex z-score over time for one window (``§4`` step b).
+def _zscore_over_time(rows: np.ndarray) -> np.ndarray:
+    """Per-vertex z-score over time (``§4`` step e -- the global normalisation).
 
-    ``(x - mean_t) / (std_t + 1e-6)`` along the time (row) axis. The ``+eps``
-    keeps a constant vertex finite (it maps to ~0).
+    ``(x - mean_t) / (std_t + 1e-6)`` along the time (row) axis. Applied ONCE to
+    the whole stitched timeline (one common scale across windows), not per
+    window. The ``+eps`` keeps a constant vertex finite (it maps to ~0).
     """
-    mean_t = win_preds.mean(axis=0, keepdims=True)
-    std_t = win_preds.std(axis=0, keepdims=True)
-    return (win_preds - mean_t) / (std_t + _ZSCORE_EPS)
+    mean_t = rows.mean(axis=0, keepdims=True)
+    std_t = rows.std(axis=0, keepdims=True)
+    return (rows - mean_t) / (std_t + _ZSCORE_EPS)
 
 
 def _trapezoid_weights(

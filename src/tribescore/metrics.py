@@ -293,7 +293,7 @@ def to_metrics(
     Parameters
     ----------
     timeline:
-        Activity of shape ``(T, 20484)`` (the stitched, per-window-z-scored
+        Activity of shape ``(T, 20484)`` (the stitched, globally-z-scored
         output of :func:`tribescore.windowing.stitch`). Columns are
         ``fsaverage5`` vertices in the order the model emits them.
     masks:

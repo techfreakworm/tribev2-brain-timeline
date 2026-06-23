@@ -51,8 +51,16 @@ def synth_infer_fn(
     Parameters
     ----------
     signal:
-        ``"ramp"``   -> column k at abs time t is ``t + k``;
-        ``"sine"``   -> a slow sine of t (+ a per-column phase).
+        ``"ramp"``      -> column k at abs time t is ``t + k``;
+        ``"sine"``      -> a slow sine of t (+ a per-column phase);
+        ``"step_sine"`` -> a fast carrier ``sin(2*pi*t/8)`` modulated by a
+        **step amplitude envelope** in *absolute* time: ``1.0`` for ``t < 150``
+        then ``0.2``. This is a genuine cross-window amplitude difference (a loud
+        early regime, a quiet late one) that is *real content* under the global
+        z-score (preserved) but is *erased* by the old per-window z-score (each
+        100 s window is rescaled to unit std, equalising the regimes). The
+        envelope is flat *within* each 100 s window so per-window normalisation
+        has a well-defined between-window difference to (wrongly) cancel.
     per_window_offset, per_window_scale:
         Add ``w * per_window_offset`` and multiply by ``per_window_scale**w``
         per window ``w`` -- an arbitrary per-window level/scale that per-window
@@ -70,6 +78,10 @@ def synth_infer_fn(
         elif signal == "sine":
             phase = np.arange(n_k)[None, :] * 0.3
             rows = np.sin(2.0 * np.pi * abs_t[:, None] / 50.0 + phase)
+        elif signal == "step_sine":
+            amp = np.where(abs_t < 150.0, 1.0, 0.2)  # loud early, quiet late
+            carrier = np.sin(2.0 * np.pi * abs_t / 8.0)
+            rows = (carrier * amp)[:, None] * np.ones(n_k)[None, :]
         else:  # pragma: no cover - guard
             raise ValueError(signal)
         rows = rows * (per_window_scale ** w) + w * per_window_offset
@@ -238,12 +250,51 @@ def test_stitch_no_zero_weight_gaps():
     assert np.all(np.isfinite(timeline))
 
 
+def test_stitch_global_scale_consistency_across_seam():
+    """One global scale: real cross-window amplitude differences are preserved.
+
+    Drives a step-amplitude signal (loud ``t < 150``, quiet ``t >= 150``) sampled
+    identically by the overlapping windows. Under the corrected normalisation
+    contract a *single* per-vertex z-score is applied over the whole stitched
+    timeline, so "activity" means the same thing everywhere: the louder early
+    band stays louder than the quieter late band (genuine content). The old
+    per-window z-score instead forced every 100 s window to unit std, equalising
+    the two regimes (ratio ~ 1) AND manufacturing a scale-mismatch seam step.
+    """
+    duration = 300.0
+    preds, abs_times = synth_infer_fn(duration, n_k=1, signal="step_sine")
+    timeline, t_axis = stitch(preds, abs_times)
+
+    # (1) The early (loud) band must be materially louder than the late (quiet)
+    # band -- preserved by ONE global scale, equalised by the per-window z-score.
+    early_std = np.std(timeline[0:50])
+    late_std = np.std(timeline[250:300])
+    assert early_std > 2.0 * late_std, (
+        f"cross-window amplitude difference erased: early std {early_std:.4f} "
+        f"vs late std {late_std:.4f} (ratio {early_std / late_std:.3f})"
+    )
+
+    # (2) No seam spike: the adjacent-second jump *at* each seam must be no worse
+    # than the largest jump anywhere in the timeline (the legitimate step at
+    # t=150 dominates `diffs.max()`, so a smooth seam easily clears this bound).
+    diffs = np.abs(np.diff(timeline, axis=0))
+    for t in range(HOP_S, int(duration), HOP_S):  # 80, 160, 240
+        assert diffs[t - 1].max() <= diffs.max() + 1e-9, (
+            f"seam spike at t={t}: {diffs[t - 1].max():.4f} > max {diffs.max():.4f}"
+        )
+
+
 def test_stitch_seam_continuity_no_jump():
     """No discontinuity at the known seams (t == hop, 2*hop, ...)."""
     duration = 300.0
+    # Consistent-scale signal (no synthetic per-window offset). Under the
+    # corrected contract stitch z-scores ONCE over the whole timeline, so a
+    # smooth same-scale signal must stay continuous across every seam; an
+    # arbitrary per-window DC level is not a phenomenon stitch cancels (real
+    # tribev2 emits consistent-scale preds), so it is not modelled here.
     preds, abs_times = synth_infer_fn(
         duration, n_k=4, signal="sine",
-        per_window_offset=3.0, per_window_scale=1.0,  # arbitrary per-window level
+        per_window_offset=0.0, per_window_scale=1.0,
     )
     timeline, t_axis = stitch(preds, abs_times)
 
@@ -262,19 +313,29 @@ def test_stitch_seam_continuity_no_jump():
         assert seam_jump < 0.5, f"seam at t={t} jumped {seam_jump}"
 
 
-def test_stitch_cancels_per_window_offset_and_scale():
-    """Per-window z-score removes arbitrary per-window level + scale (§4 3b)."""
+def test_stitch_preserves_cross_window_amplitude():
+    """Genuine cross-window amplitude differences are PRESERVED, not cancelled.
+
+    The corrected contract z-scores ONCE over the whole stitched timeline, so a
+    loud regime stays loud relative to a quiet one -- that scale difference is
+    *real content* (calm vs active), not an artifact to equalise. (The old
+    per-window z-score forced every 100 s window to unit std, erasing exactly
+    this; the inverse of that overturned premise is asserted here.)
+    """
     duration = 300.0
-    # Two synth runs that differ ONLY by a per-window affine transform; their
-    # stitched timelines must match (z-score is invariant to per-window a*x+b).
-    p0, t0 = synth_infer_fn(duration, n_k=4, signal="sine")
-    p1, t1 = synth_infer_fn(
-        duration, n_k=4, signal="sine",
-        per_window_offset=10.0, per_window_scale=2.0,
+    # Step-amplitude signal: loud for t < 150, quiet (x0.2) after. The early
+    # band sits wholly in the loud regime, the late band wholly in the quiet one.
+    preds, abs_times = synth_infer_fn(duration, n_k=4, signal="step_sine")
+    timeline, _ = stitch(preds, abs_times)
+
+    loud_band = np.std(timeline[0:50])     # abs t in [0, 50): amp 1.0
+    quiet_band = np.std(timeline[250:300])  # abs t in [250, 300): amp 0.2
+    # The 5x raw-amplitude ratio survives a single global z-score (it only
+    # rescales both bands by the SAME factor) -> the loud band stays far louder.
+    assert loud_band > 2.0 * quiet_band, (
+        f"cross-window amplitude erased: loud {loud_band:.4f} vs "
+        f"quiet {quiet_band:.4f} (ratio {loud_band / quiet_band:.3f})"
     )
-    tl0, _ = stitch(p0, t0)
-    tl1, _ = stitch(p1, t1)
-    assert np.allclose(tl0, tl1, atol=1e-6)
 
 
 def test_stitch_warmup_rows_excluded():
@@ -312,10 +373,14 @@ def test_stitch_duplicate_seconds_are_weighted_averaged():
     # so overlap is non-trivial and warm-up (5) does not erase the whole overlap.
     win_s, hop_s, warm = 10, 6, 1
     n_k = 2
-    # Window A: secs 0..9, constant value 0 on all vertices.
+    # Both windows the SAME constant (value 1.0): window A covers secs 0..9,
+    # window B covers secs 6..15, overlapping at secs 6..9. A globally-constant
+    # signal exercises the divide-by-zero safety of the final global z-score.
+    # (Two DIFFERENT constants are NOT used: a 0 -> 1 level change is *real*
+    # signal under the global z-score -- it does not cancel to zeros, unlike the
+    # old per-window z-score; that overturned premise is no longer asserted.)
     a_t = np.arange(0, 10, dtype=float)
-    a_p = np.zeros((10, n_k))
-    # Window B: secs 6..15, constant value 1.0 (a clear, different level).
+    a_p = np.ones((10, n_k))
     b_t = np.arange(6, 16, dtype=float)
     b_p = np.ones((10, n_k))
     preds = np.concatenate([a_p, b_p], axis=0)
@@ -324,9 +389,9 @@ def test_stitch_duplicate_seconds_are_weighted_averaged():
     timeline, t_axis = stitch(
         preds, abs_times, warmup_trim=warm, hop_s=hop_s, win_s=win_s
     )
-    # Both windows are constant -> z-score maps each to all-zeros; a constant
-    # signal stitches to zeros everywhere. This confirms per-window z-score and
-    # that overlapped seconds remain finite (no divide-by-zero in the mean).
+    # A constant timeline has zero temporal std -> the global z-score's +eps
+    # denominator keeps it finite and maps it to ~0 (no divide-by-zero), and the
+    # overlapped seconds remain finite (no divide-by-zero in the weighted mean).
     assert np.all(np.isfinite(timeline))
     assert np.allclose(timeline, 0.0, atol=1e-6)
 
@@ -340,7 +405,8 @@ def test_stitch_duplicate_seconds_are_weighted_averaged():
         preds2, abs_times, warmup_trim=warm, hop_s=hop_s, win_s=win_s
     )
     # In the overlap (secs 6..9) both windows carry the same underlying ramp; a
-    # weighted average of two identical (post-z-score) shapes is continuous.
+    # weighted average of two identical raw shapes, then ONE global z-score (an
+    # affine map that preserves continuity), is smooth across the seam.
     diffs = np.abs(np.diff(tl2, axis=0))
     assert diffs.max() < 0.5  # smooth across the overlapped/averaged seam
 
