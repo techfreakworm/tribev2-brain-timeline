@@ -36,6 +36,63 @@ os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.3")
 os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.6")
 
+# Writable HF cache — MUST run BEFORE `import gradio` (line below), because gradio
+# imports huggingface_hub, which FREEZES HF_HUB_CACHE (= $HF_HOME/hub) AND
+# HF_XET_CACHE (= $HF_HOME/xet) as module constants at import time. The Space bakes
+# ~/.cache/huggingface read-only (owned by the BUILD user) via `preload_from_hub`,
+# so uid-1000 can READ baked repos but cannot create the NEW repo dirs the gated
+# Quality stack (Llama / whisperx-xet) needs -> EACCES. We copy the baked tree once
+# to a writable dir and point HF_HOME there so hub/ + xet/ both resolve writable AND
+# populated (no re-download of the ~14 GB baked set). The @gpu fork inherits this via
+# the parent env. Space-only; the whole block is wrapped so ANY failure falls back to
+# today's behavior (Quality EACCES, Fast unaffected) and NEVER crashes boot.
+#   - `symlinks=True` is load-bearing: without it copytree FOLLOWS the cache's
+#     snapshot->blob symlinks and copies bytes per link (~2x disk -> disk-full).
+#   - skip the copy when free disk < 20 GB (50 GB ephemeral, baked hub + env already
+#     consume most); fall back to today's behavior rather than risk a disk-full boot.
+#   - a `.copy_complete` sentinel written ONLY after copytree returns guards against a
+#     half-finished copy from a crashed boot looking "populated" -> partial cache.
+if os.environ.get("SPACE_ID") or os.environ.get("SPACE_HOST"):
+    try:
+        import shutil as _shutil
+
+        _base = None
+        for _cand in ("/data", os.path.join(os.getcwd(), "cache")):
+            try:
+                os.makedirs(_cand, exist_ok=True)
+                if os.access(_cand, os.W_OK):
+                    _base = _cand
+                    break
+            except Exception:
+                continue
+        if _base is None:
+            _base = tempfile.mkdtemp(prefix="tribescore-hf-")
+        _hfh = os.path.join(_base, "huggingface")
+        _sentinel = os.path.join(_hfh, ".copy_complete")
+        _src = os.path.expanduser("~/.cache/huggingface")
+        if not os.path.exists(_sentinel) and os.path.isdir(_src):
+            _free = _shutil.disk_usage(_base).free
+            print(f"[hf-cache] free={_free / 1e9:.1f}GB at {_base}", flush=True)
+            if _free > 20 * 1e9:
+                _shutil.copytree(
+                    _src, _hfh, dirs_exist_ok=True,
+                    symlinks=True, ignore_dangling_symlinks=True,
+                )
+                with open(_sentinel, "w") as _f:
+                    _f.write("ok")
+                print(f"[hf-cache] copied baked HF cache -> writable {_hfh}", flush=True)
+            else:
+                print(f"[hf-cache] SKIPPED copy (free {_free / 1e9:.1f}GB < 20GB) "
+                      "-> Quality downloads may EACCES", flush=True)
+        if os.path.exists(_sentinel):
+            os.environ["HF_HOME"] = _hfh
+            os.environ["HF_HUB_CACHE"] = os.path.join(_hfh, "hub")
+            os.environ["HF_XET_CACHE"] = os.path.join(_hfh, "xet")
+            print(f"[hf-cache] HF_HOME -> {_hfh}", flush=True)
+    except Exception as _exc:
+        print(f"[hf-cache] writable HF cache prep FAILED "
+              f"(Quality may EACCES, Fast unaffected): {_exc!r}", flush=True)
+
 # src-layout: the local ``tribescore`` package lives under ``src/``. HF Spaces
 # runs this file from the repo root with no editable install, so make the
 # package importable by putting ``<repo>/src`` on the path before importing it.
@@ -108,33 +165,6 @@ os.environ.setdefault("MNE_DATA", os.path.join(CACHE_DIR, "mne_data"))
 os.makedirs(os.environ["MNE_DATA"], exist_ok=True)
 
 
-def _ensure_writable_hub() -> None:
-    """Make the HF hub cache writable for runtime downloads (whisper + LLaMA).
-
-    preload_from_hub bakes ~/.cache/huggingface/hub into the image at BUILD owned
-    by the build user, so uid 1000 can't create the NEW repo dirs the opt-in ASR
-    (faster-whisper) + LLaMA need at runtime -> EACCES. Copy the preloaded tree
-    once into a writable dir and redirect HF_HUB_CACHE there (preserves preload
-    -> no re-download; now writable). Idempotent; only invoked on the opt-in
-    full-multimodal path so the fast default path stays lean.
-
-    SPACE-ONLY: off-Space the default ~/.cache/huggingface is already writable, and
-    a developer's hub may hold 100s of GB of UNRELATED models -> copying it would
-    fill the disk (it did: a 124GB copy of the Wan models). Locally, no-op.
-    """
-    if not on_spaces():
-        return
-    import shutil
-
-    target = os.path.join(CACHE_DIR, "hub")
-    default_hub = os.path.expanduser("~/.cache/huggingface/hub")
-    if not os.path.isdir(target) or not os.listdir(target):
-        os.makedirs(target, exist_ok=True)
-        if os.path.isdir(default_hub):
-            shutil.copytree(default_hub, target, dirs_exist_ok=True)
-    os.environ["HF_HUB_CACHE"] = target
-
-
 # --- spaces.GPU shim: real decorator on the Space, no-op locally ------------
 try:  # pragma: no cover - exercised only where `spaces` is installed
     import spaces
@@ -175,6 +205,9 @@ if on_spaces():
     # PREWARM_QUALITY.
     try:
         from tribescore.prewarm import prewarm_all
+        # Writability is handled by the early HF_HOME redirect (top of this file,
+        # before `import gradio`); the gated Quality downloads here land in the
+        # writable copy. Downloads stay gated by PREWARM_QUALITY inside prewarm_all.
         prewarm_all(CACHE_DIR, model=_startup_model)
     except Exception as exc:
         logger.warning("startup pre-warm failed (assets download on first use): %r", exc)
@@ -185,13 +218,9 @@ if on_spaces():
 def _gpu_infer(mode: str, src_path: str, audio_only: bool):
     """Run one whole-clip predict() on ZeroGPU. Everything else is CPU."""
     model = load_model(CACHE_DIR)  # singleton: instant after eager startup load
-    if not audio_only:
-        # Opt-in full-multimodal path downloads NEW repos (whisper, LLaMA) into
-        # the hub cache, which preload baked read-only -> make it writable first.
-        try:
-            _ensure_writable_hub()
-        except Exception:
-            pass
+    # NOTE: the full-multimodal path's NEW repos (whisper, LLaMA) download into the
+    # writable HF cache set up by the early HF_HOME redirect (top of file) — which
+    # this fork inherits via the parent env. No per-Score hub copy needed here.
     _torch = None
     try:  # TF32 fast matmul/conv (no result change) + peak-VRAM telemetry (logs)
         import torch as _torch
