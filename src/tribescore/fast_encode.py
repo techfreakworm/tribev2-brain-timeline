@@ -237,6 +237,13 @@ def apply_frame_dedup_encode() -> bool:
                 model.model.to(self.image.device)
             dev = model.model.device
 
+            # Local MPS safety gate: refuse to start if there isn't headroom for a
+            # bounded clip under the system memory ceiling (MPS wired mem is invisible
+            # to RSS — guard on vm_stat). No-op off MPS.
+            if torch.backends.mps.is_available():
+                from tribescore import memguard
+                memguard.require_headroom()
+
             freq0 = events[0].frequency if self.frequency == "native" else self.frequency
             T = 1 / freq0 if self.clip_duration is None else self.clip_duration
             subtimes = list(
@@ -321,6 +328,11 @@ def apply_frame_dedup_encode() -> bool:
                     if not output.size:
                         output = np.zeros((len(times),) + embd.shape)
                     output[k] = embd
+                    # Every ~8 clips, abort cleanly if system memory crosses the
+                    # ceiling (e.g. another app grabbed RAM) — before the OS OOMs.
+                    if _mps and k % 8 == 0:
+                        from tribescore import memguard
+                        memguard.check_or_abort()
                     # MPS-ONLY: the Metal caching allocator does NOT return per-clip
                     # intermediates (40-layer hidden_states + attention) to the OS, so
                     # RSS grows ~linearly per TR and OOMs the machine (125 GB on a 15 s
