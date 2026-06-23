@@ -262,6 +262,7 @@ def run_inference(
     src_path: str,
     *,
     audio_only: bool = False,
+    out_info: dict | None = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Run one whole-clip ``predict()`` and return per-TR activity + abs times.
 
@@ -329,6 +330,18 @@ def run_inference(
         events = _build_audio_only_events(mode, src_path)
     else:
         events = model.get_events_dataframe(**{f"{mode}_path": src_path})
+
+    # Surface the synthesized-speech file (text mode) so the UI can preview the
+    # actual audio the model scored — the text path TTS-synthesises speech inside
+    # get_events_dataframe, and its "Audio" event's filepath is that file (written
+    # under the infra cache dir -> servable by the app's file route). Best-effort.
+    if out_info is not None and mode == "text":
+        try:
+            arows = events[events["type"] == "Audio"]
+            if len(arows):
+                out_info["media_path"] = str(arows.iloc[0]["filepath"])
+        except Exception:
+            pass
 
     preds, segments = model.predict(events)
     preds = np.asarray(preds, dtype=float)

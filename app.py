@@ -100,7 +100,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src
 
 import gradio as gr
 
-import profiler  # temporary ZeroGPU step-1 profiling harness
 import theme
 import ui
 from tribescore import __version__
@@ -258,7 +257,10 @@ def _gpu_infer(mode: str, src_path: str, audio_only: bool):
             apply_frame_dedup_encode()
         except Exception:
             pass
-    out = run_inference(model, mode, src_path, audio_only=audio_only)
+    # info carries the text-mode synthesized-speech path back out of the (forked)
+    # GPU worker so _score_impl can preview the actual audio the model scored.
+    info: dict = {}
+    preds, abs_times = run_inference(model, mode, src_path, audio_only=audio_only, out_info=info)
     try:  # backbone_hit=True proves the fork reused the startup-built backbone
         from tribescore.fast_encode import LAST_TIMING
         if LAST_TIMING:
@@ -270,7 +272,7 @@ def _gpu_infer(mode: str, src_path: str, audio_only: bool):
             logger.info("PEAK_VRAM_GB=%.2f", _torch.cuda.max_memory_allocated() / 1e9)
     except Exception:
         pass
-    return out
+    return preds, abs_times, info.get("media_path")
 
 
 # --- helpers ----------------------------------------------------------------
@@ -300,23 +302,32 @@ def _text_to_tmp(text: str) -> str:
     return path
 
 
-def _media_html(mode: str, src_path: str) -> str:
+def _media_html(mode: str, src_path: str, *, synthesized: bool = False) -> str:
     """Custom ``id='tm-video'`` media element the timeline click seeks (§6).
 
-    Uses Gradio's file route to serve the uploaded file. Best-effort: if the
-    route differs, the timeline + metrics still render; only seek is affected.
+    Uses Gradio's file route to serve the file. Best-effort: if the route differs,
+    the timeline + metrics still render; only seek is affected. ``synthesized=True``
+    (text mode, where ``src_path`` is the TTS speech the model scored) adds a caption
+    clarifying the audio is the synthesized speech.
     """
-    url = "/gradio_api/file=" + os.path.abspath(src_path)
+    if mode == "video":
+        url = "/gradio_api/file=" + os.path.abspath(src_path)
+        suffix = Path(src_path).suffix.lower().lstrip(".") or "mp4"
+        return ui.video_html(url, mime=f"video/{suffix}")
     if mode == "audio":
+        url = "/gradio_api/file=" + os.path.abspath(src_path)
+        cap = (
+            '<div style="margin-top:6px;font-size:.78rem;opacity:.65;text-align:center">'
+            "▶ synthesized speech (text → TTS) — the audio the model scored; "
+            "click a timeline spike to seek</div>"
+        ) if synthesized else ""
         return (
             '<div class="co-video-wrap">'
             f'<audio id="tm-video" controls preload="metadata" src="{url}">'
-            "Your browser can't play this audio.</audio></div>"
+            "Your browser can't play this audio.</audio>"
+            f"{cap}</div>"
         )
-    if mode == "video":
-        suffix = Path(src_path).suffix.lower().lstrip(".") or "mp4"
-        return ui.video_html(url, mime=f"video/{suffix}")
-    # text mode: synthesized speech is internal; no preview element.
+    # text mode with no synthesized-speech path available: no preview element.
     return (
         '<div class="co-video-wrap"><div class="co-video-empty">'
         "synthesized speech (no preview) — timeline below</div></div>"
@@ -406,7 +417,7 @@ def _score_impl(mode, src_path, selected_names, audio_only, progress):
                 return _fail("Enter some text to score.")
 
         progress(0.15, desc="Running tribev2 on ZeroGPU (feature extraction + prediction)…")
-        preds, abs_times = _gpu_infer(mode, src_path, bool(audio_only))
+        preds, abs_times, text_media = _gpu_infer(mode, src_path, bool(audio_only))
 
         if preds.shape[0] == 0:
             return _fail(
@@ -438,7 +449,13 @@ def _score_impl(mode, src_path, selected_names, audio_only, progress):
         summary_str = ui.summary_html(stats_html)
 
         progress(1.0, desc="Done.")
-        media = _media_html(mode, src_path)
+        # Text mode previews the synthesized speech the model actually scored (so a
+        # spike-click can seek it), exactly like Audio mode. If the synthesized path
+        # came back, render it as audio; otherwise fall back to the no-preview note.
+        if mode == "text" and text_media:
+            media = _media_html("audio", text_media, synthesized=True)
+        else:
+            media = _media_html(mode, src_path)
         return _ok(media, fig, summary_str)
 
     except Exception as exc:  # surface a clean, actionable message
@@ -468,9 +485,6 @@ def build_demo() -> gr.Blocks:
             '<div class="co-status-dot">in-silico neuroscience</div>'
             "</div>"
         )
-
-        # Temporary step-1 profiling harness (compute-bound + large vs xlarge).
-        profiler.build_profiler()
 
         if on_spaces():
             gr.HTML(

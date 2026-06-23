@@ -185,7 +185,15 @@ README configures it. To deploy your own:
    (a token from an account with access). Gated repos cannot be preloaded at build
    (no build-time auth), so they download at runtime into a writable cache.
    Without the token, use **Fast mode** / Video+Audio, which skip the text path.
-5. All model weights download at runtime on the Space; nothing is vendored here.
+5. **Set the `PREWARM_QUALITY=1` Space _variable_** (Settings → Variables) to
+   pre-cache the Quality stack (Llama-3.2-3B + whisperx + spaCy) during the
+   **un-billed container startup**, so the first Quality Score doesn't download
+   them inside the billed `@spaces.GPU` call. On startup `app.py` redirects
+   `HF_HOME` to a writable copy of the baked cache — the baked hub is read-only, so
+   gated runtime downloads would otherwise `EACCES`. Without the variable, Fast
+   mode still works and Quality mode downloads the stack on first use (slower, and
+   that download is billed).
+6. All model weights download at runtime on the Space; nothing is vendored here.
 
 ### Requirements
 
