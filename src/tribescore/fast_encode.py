@@ -101,6 +101,47 @@ def _register_layer_empty_cache_hooks(hf_model, every: int) -> int:
     return n
 
 
+def _blocked_eager_attention_forward(module, query, key, value, attention_mask, scaling,
+                                     dropout=0.0, **kwargs):
+    """Query-blocked equivalent of VJEPA2's eager_attention_forward — never
+    materializes the (B,H,N,N) score matrix. Math-identical (RoPE already applied to
+    q,k; bidirectional, no causal/additive bias; softmax over keys). Returns None for
+    attention weights (the caller uses them only when output_attentions=True, which
+    the dedup path does not). MPS-only via the build_video_model gate."""
+    import torch as _torch
+    import torch.nn.functional as _F
+    n = query.shape[-2]
+    block = int(os.environ.get("TRIBE_ATTN_BLOCK", "512"))
+    kT = key.transpose(-1, -2)
+    chunks = []
+    for i in range(0, n, block):
+        q = query[:, :, i:i + block, :]
+        w = _torch.matmul(q, kT) * scaling
+        w = _F.softmax(w, dim=-1, dtype=_torch.float32).to(query.dtype)
+        if dropout:
+            w = _F.dropout(w, p=dropout, training=module.training)
+        if attention_mask is not None:
+            w = w * attention_mask[..., i:i + block, :]
+        chunks.append(_torch.matmul(w, value))
+    attn_output = _torch.cat(chunks, dim=2).transpose(1, 2).contiguous()
+    return attn_output, None
+
+
+def _apply_blocked_attention() -> bool:
+    """Monkeypatch VJEPA2's module-level eager_attention_forward with the blocked
+    version (the forward reads it as a global at call time). Idempotent. MPS-only."""
+    try:
+        import transformers.models.vjepa2.modeling_vjepa2 as _m
+    except Exception:
+        return False
+    if getattr(_m, "_tribescore_blocked_attn", False):
+        return True
+    _m.eager_attention_forward = _blocked_eager_attention_forward
+    _m._tribescore_blocked_attn = True
+    logger.info("applied blocked V-JEPA2 attention (query-block streaming)")
+    return True
+
+
 def build_video_model(model_name: str, pretrained, layer_type, num_frames):
     """Get-or-build a cached (CPU) ``_HFVideoModel`` backbone. Idempotent.
 
@@ -150,12 +191,14 @@ def build_video_model(model_name: str, pretrained, layer_type, num_frames):
     finally:
         if _eager:
             _AM.from_pretrained = _orig_fp
-    # Bound the per-clip MPS peak: free the O(N²) attention transients per-layer
-    # during the forward (numerically identical — frees only unreferenced memory).
-    # MPS-only; on CUDA the per-clip empty_cache + VRAM headroom suffice.
+    # Bound the per-clip MPS peak STRUCTURALLY: compute V-JEPA2 attention in
+    # query-blocks so the (B,H,8192,8192) score matrix is never materialized -> the
+    # per-layer attn transient is ~block/N smaller, capping the per-clip peak with NO
+    # empty_cache allocator thrash (the per-layer hook bounded memory too but cost
+    # ~17.5 min/15s-clip on MPS). Math-identical to stock eager (parity test gate).
+    # MPS-only; on CUDA the Space keeps real SDPA + has VRAM headroom (untouched).
     if _torch.backends.mps.is_available() and "vjepa2" in model_name:
-        every = int(os.environ.get("TRIBE_MPS_EMPTY_EVERY", "4"))
-        _register_layer_empty_cache_hooks(model.model, every=every)
+        _apply_blocked_attention()
     _VIDEO_MODEL_CACHE[key] = model
     LAST_BACKBONE.update(hit=False, build_s=round(_time.perf_counter() - _t, 2))
     logger.info(
