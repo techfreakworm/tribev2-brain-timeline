@@ -26,6 +26,16 @@ from pathlib import Path
 # (lazy) torch import inside ``load_model``. No-op on CUDA/ZeroGPU.
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
+# Bound the Metal allocator (the difference between video mode running and OOM-ing
+# the OS). The LOW watermark defaults to 1.4 (~134GB on a 128GB Mac, ABOVE physical
+# RAM) so "adaptive commit" never fires, and a 40-layer V-JEPA2 forward queues every
+# layer's attention buffer without freeing -> ~90GB for ONE clip -> OS crash. A LOW
+# ratio makes the allocator commit + free completed-op buffers DURING the forward
+# (bounds the peak); the HIGH ratio is a catchable hard cap (raises a RuntimeError we
+# surface as "input too large" instead of crashing). MPS-only -> no-op on CUDA/ZeroGPU.
+os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.3")
+os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.6")
+
 # src-layout: the local ``tribescore`` package lives under ``src/``. HF Spaces
 # runs this file from the repo root with no editable install, so make the
 # package importable by putting ``<repo>/src`` on the path before importing it.
@@ -107,7 +117,13 @@ def _ensure_writable_hub() -> None:
     once into a writable dir and redirect HF_HUB_CACHE there (preserves preload
     -> no re-download; now writable). Idempotent; only invoked on the opt-in
     full-multimodal path so the fast default path stays lean.
+
+    SPACE-ONLY: off-Space the default ~/.cache/huggingface is already writable, and
+    a developer's hub may hold 100s of GB of UNRELATED models -> copying it would
+    fill the disk (it did: a 124GB copy of the Wan models). Locally, no-op.
     """
+    if not on_spaces():
+        return
     import shutil
 
     target = os.path.join(CACHE_DIR, "hub")

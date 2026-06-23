@@ -31,6 +31,7 @@ assert max-abs preds diff is float-noise. Until then it is OFF by default
 from __future__ import annotations
 
 import logging
+import os
 
 logger = logging.getLogger("tribescore.fast_encode")
 
@@ -52,6 +53,15 @@ _VIDEO_MODEL_CACHE: dict = {}
 #: relies on); ``build_s`` is the (un-billed) build time when it was a miss.
 LAST_BACKBONE: dict = {"hit": None, "build_s": 0.0}
 
+#: Per-fork cache of the dedup's MATERIALIZED output (one TimedArray per event),
+#: keyed by event identity. The DataLoader's per-window __call__ -> _get_timed_arrays
+#: -> _get_data re-invokes this; without the cache it RE-EXTRACTS every window (the
+#: dedup bypasses exca's cache), which on a 60s/1080p clip was ~59s of redundant
+#: billed work (~half the Score). With it, prepare extracts ONCE and the loop
+#: retrieves. Exact (returns the identical TimedArray, no recompute). Bounded +
+#: naturally per-Score since each @spaces.GPU fork is fresh.
+_DEDUP_OUT_CACHE: dict = {}
+
 
 def build_video_model(model_name: str, pretrained, layer_type, num_frames):
     """Get-or-build a cached (CPU) ``_HFVideoModel`` backbone. Idempotent.
@@ -70,13 +80,38 @@ def build_video_model(model_name: str, pretrained, layer_type, num_frames):
         LAST_BACKBONE.update(hit=True, build_s=0.0)
         return model
     _t = _time.perf_counter()
-    model = _HFVideoModel(
-        model_name=model_name,
-        pretrained=pretrained,
-        layer_type=layer_type,
-        num_frames=num_frames,
-    )
-    _ = model.model  # force the lazy from_pretrained build now (so it's timed here)
+    # MPS-ONLY: force EAGER attention for V-JEPA2. The default SDPA falls back to the
+    # O(N^2) MPSGraph path and, at 8192 tokens/clip, the unsupported op materializes
+    # on CPU (PYTORCH_ENABLE_MPS_FALLBACK) -> ~90GB/clip -> OS OOM. Eager attention is
+    # plain matmul+softmax (all MPS-supported, stays on-device, numerically identical
+    # to SDPA), so it stays in the Metal pool where the watermark can bound it. CUDA
+    # (the Space) keeps fast SDPA. neuralset's _HFVideoModel doesn't expose the kwarg,
+    # so we transiently inject it into AutoModel.from_pretrained for this build only.
+    import torch as _torch
+
+    _eager = _torch.backends.mps.is_available() and "vjepa2" in model_name
+    if _eager:
+        import transformers as _tf
+
+        _AM = _tf.AutoModel
+        _orig_fp = _AM.from_pretrained
+
+        def _eager_from_pretrained(name, *a, **k):
+            k.setdefault("attn_implementation", "eager")
+            return _orig_fp(name, *a, **k)
+
+        _AM.from_pretrained = _eager_from_pretrained
+    try:
+        model = _HFVideoModel(
+            model_name=model_name,
+            pretrained=pretrained,
+            layer_type=layer_type,
+            num_frames=num_frames,
+        )
+        _ = model.model  # force the from_pretrained build now (so it's timed here)
+    finally:
+        if _eager:
+            _AM.from_pretrained = _orig_fp
     _VIDEO_MODEL_CACHE[key] = model
     LAST_BACKBONE.update(hit=False, build_s=round(_time.perf_counter() - _t, 2))
     logger.info(
@@ -121,6 +156,30 @@ def apply_frame_dedup_encode() -> bool:
         if "vjepa2" not in self.image.model_name:
             yield from _orig.__get__(self, type(self))(events)
             return
+        # Output cache (opt-in via TRIBE_DEDUP_CACHE; default OFF until the
+        # multi-window parity gate passes). Key = filepath + extractor CONFIG, NO
+        # duration: the loader's per-window __call__ passes a WINDOWED event (its
+        # duration is the window, not the full clip), so a duration key would miss;
+        # one file+config = one full extraction, sliced downstream per window.
+        cache_on = bool(os.environ.get("TRIBE_DEDUP_CACHE"))
+        ckeys = []
+        for _ev in events:
+            if not cache_on:
+                ckeys.append(None)
+                continue
+            try:
+                ckeys.append((
+                    getattr(_ev, "filepath", None) or repr(_ev),
+                    self.image.model_name, self.layer_type,
+                    str(self.frequency), self.num_frames, self.max_imsize,
+                ))
+            except Exception:
+                ckeys.append(None)
+        # Fast path: all events already extracted -> retrieve without building anything.
+        if ckeys and all(k is not None and k in _DEDUP_OUT_CACHE for k in ckeys):
+            for k in ckeys:
+                yield _DEDUP_OUT_CACHE[k]
+            return
         try:
             # Reuse the startup-built CPU backbone (un-bills the per-Score
             # from_pretrained); each fork inherits it COW and only pays .to(cuda).
@@ -139,13 +198,21 @@ def apply_frame_dedup_encode() -> bool:
             subtimes = list(
                 k / model.num_frames * T for k in reversed(range(model.num_frames))
             )
-            ctx = (
-                torch.autocast("cuda", dtype=torch.bfloat16)
-                if torch.cuda.is_available()
-                else nullcontext()
-            )
+            # bf16 autocast: ~2x on CUDA (the Space). On MPS it ALSO halves the
+            # per-layer attention buffers so the eager forward fits under the Metal
+            # watermark (fp32 eager still peaked ~57GB/clip). bf16-on-MPS matches the
+            # bf16 Space output better than fp32 did, so it's a parity improvement.
+            if torch.cuda.is_available():
+                ctx = torch.autocast("cuda", dtype=torch.bfloat16)
+            elif torch.backends.mps.is_available():
+                ctx = torch.autocast("mps", dtype=torch.bfloat16)
+            else:
+                ctx = nullcontext()
 
-            for event in events:
+            for event, ckey in zip(events, ckeys):
+                if ckey is not None and ckey in _DEDUP_OUT_CACHE:
+                    yield _DEDUP_OUT_CACHE[ckey]  # already extracted this Score
+                    continue
                 video = event.read()
                 freq = self.frequency if self.frequency != "native" else event.frequency
                 expect_frames = nsbase.Frequency(freq).to_ind(event.duration)
@@ -190,6 +257,7 @@ def apply_frame_dedup_encode() -> bool:
 
                 # Assemble + forward each clip by indexing the unique prepped frames.
                 _tf = _time.perf_counter()
+                _mps = torch.backends.mps.is_available()
                 output = np.array([])
                 for k, ts_list in enumerate(clip_ts):
                     sel = [idx_of[_key(ts)] for ts in ts_list]
@@ -204,6 +272,15 @@ def apply_frame_dedup_encode() -> bool:
                     if not output.size:
                         output = np.zeros((len(times),) + embd.shape)
                     output[k] = embd
+                    # MPS-ONLY: the Metal caching allocator does NOT return per-clip
+                    # intermediates (40-layer hidden_states + attention) to the OS, so
+                    # RSS grows ~linearly per TR and OOMs the machine (125 GB on a 15 s
+                    # clip). Free + reclaim each iteration -> bounds peak to ~1 clip.
+                    # CUDA (the Space) is skipped so it stays fast; it has VRAM headroom.
+                    if _mps:
+                        del pred, states, out, embd, clip_pv
+                        if hasattr(torch.mps, "empty_cache"):
+                            torch.mps.empty_cache()
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 t_fwd = _time.perf_counter() - _tf
@@ -219,13 +296,28 @@ def apply_frame_dedup_encode() -> bool:
                 )
 
                 output = output.transpose(list(range(1, output.ndim)) + [0])
-                yield nsbase.TimedArray(
+                ta = nsbase.TimedArray(
                     data=output.astype(np.float32),
                     frequency=freq,
                     start=nsbase._UNSET_START,
                     duration=event.duration,
                 )
+                if ckey is not None:
+                    if len(_DEDUP_OUT_CACHE) > 6:  # safety bound (fork is per-Score anyway)
+                        _DEDUP_OUT_CACHE.clear()
+                    _DEDUP_OUT_CACHE[ckey] = ta
+                yield ta
         except Exception as exc:  # never break inference -> fall back to the correct path
+            # TRAP A: on MPS an out-of-memory / HIGH-watermark error must surface
+            # CLEANLY, not fall back — the original path decodes+processes MORE
+            # (no dedup, no empty_cache) and would re-OOM harder, crashing the OS.
+            _m = str(exc).lower()
+            if torch.backends.mps.is_available() and (
+                isinstance(exc, MemoryError)
+                or "out of memory" in _m or "watermark" in _m or "mps backend out" in _m
+            ):
+                logger.error("frame-dedup hit MPS memory limit (%r); surfacing, NOT falling back", exc)
+                raise
             logger.warning("frame-dedup encode failed (%r); falling back to original", exc)
             yield from _orig.__get__(self, type(self))(events)
 

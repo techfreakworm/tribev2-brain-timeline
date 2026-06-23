@@ -91,6 +91,44 @@ def _wrap_post_init(cls, target: str) -> None:
     cls._tribescore_mps = True
 
 
+def _patch_whisperx_compute_type() -> None:
+    """ASR (whisperx) hardcodes ``--compute_type float16`` (tribev2 eventstransforms);
+    CTranslate2 raises *"do not support efficient float16 computation"* on a CPU/MPS
+    host. Rewrite the arg to ``int8`` for the spawned whisperx call. Off-Space only
+    (the Space runs ASR on cuda -> float16 is fine). Done at the subprocess level so
+    we don't have to duplicate the ~60-line transcript function. Idempotent."""
+    try:
+        from tribev2.eventstransforms import ExtractWordsFromAudio
+    except Exception:
+        return
+    if getattr(ExtractWordsFromAudio, "_tribescore_int8", False):
+        return
+    _orig = ExtractWordsFromAudio._get_transcript_from_audio  # staticmethod -> plain fn
+
+    def _wrapped(wav_filename, language):  # noqa: ANN001 - mirror upstream signature
+        import subprocess as _sp
+
+        _orig_run = _sp.run
+
+        def _run(cmd, *a, **k):
+            if isinstance(cmd, (list, tuple)) and "--compute_type" in cmd:
+                cmd = list(cmd)
+                i = cmd.index("--compute_type")
+                if i + 1 < len(cmd) and cmd[i + 1] == "float16":
+                    cmd[i + 1] = "int8"
+            return _orig_run(cmd, *a, **k)
+
+        _sp.run = _run
+        try:
+            return _orig(wav_filename, language)
+        finally:
+            _sp.run = _orig_run
+
+    ExtractWordsFromAudio._get_transcript_from_audio = staticmethod(_wrapped)
+    ExtractWordsFromAudio._tribescore_int8 = True
+    logger.info("patched whisperx compute_type float16 -> int8 (CPU/MPS host)")
+
+
 def enable_mps(*, verbose: bool = True) -> bool:
     """Coerce neuralset HF backbones onto the local device (MPS, or CPU override).
 
@@ -124,6 +162,9 @@ def enable_mps(*, verbose: bool = True) -> bool:
             _wrap_post_init(nsv.OpticalFlow, target)
     except Exception:
         pass
+
+    # Quality/text ASR (whisperx) needs int8 on a CPU/MPS host (float16 is GPU-only).
+    _patch_whisperx_compute_type()
 
     if verbose:
         logger.info("device patch applied (HF backbones -> %s)", target)
