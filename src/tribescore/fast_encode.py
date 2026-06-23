@@ -63,6 +63,44 @@ LAST_BACKBONE: dict = {"hit": None, "build_s": 0.0}
 _DEDUP_OUT_CACHE: dict = {}
 
 
+def _register_layer_empty_cache_hooks(hf_model, every: int) -> int:
+    """Register a forward-hook on each V-JEPA2 ENCODER layer that frees the
+    per-layer attention transients during the forward, bounding the per-clip peak.
+
+    Targets ONLY `hf_model.encoder.layer` (NOT the predictor / pooler `.layer`
+    lists). Fires `torch.mps.synchronize()` + `torch.mps.empty_cache()` every
+    `every`-th layer. Idempotent via a flag set ON THE MODEL OBJECT (the model is
+    cached in `_VIDEO_MODEL_CACHE` across Score runs, so a module-level flag would
+    let hooks stack each run). Returns the number of hooks registered (0 if already
+    done or no encoder layers found). MPS-only; callers gate on MPS.
+    """
+    import torch as _torch
+
+    if getattr(hf_model, "_tribescore_layerhook", False):
+        return 0
+    enc = getattr(hf_model, "encoder", None)
+    layers = getattr(enc, "layer", None)
+    if layers is None:
+        logger.warning("layer-hook: no encoder.layer ModuleList found; relying on per-clip empty_cache")
+        return 0
+
+    counter = {"i": 0}
+
+    def _hook(_module, _inp, _out):
+        counter["i"] += 1
+        if counter["i"] % every == 0 and hasattr(_torch.mps, "empty_cache"):
+            _torch.mps.synchronize()
+            _torch.mps.empty_cache()
+
+    n = 0
+    for layer in layers:
+        layer.register_forward_hook(_hook)
+        n += 1
+    hf_model._tribescore_layerhook = True
+    logger.info("layer-hook: registered per-layer empty_cache on %d encoder layers (every=%d)", n, every)
+    return n
+
+
 def build_video_model(model_name: str, pretrained, layer_type, num_frames):
     """Get-or-build a cached (CPU) ``_HFVideoModel`` backbone. Idempotent.
 
@@ -112,6 +150,12 @@ def build_video_model(model_name: str, pretrained, layer_type, num_frames):
     finally:
         if _eager:
             _AM.from_pretrained = _orig_fp
+    # Bound the per-clip MPS peak: free the O(N²) attention transients per-layer
+    # during the forward (numerically identical — frees only unreferenced memory).
+    # MPS-only; on CUDA the per-clip empty_cache + VRAM headroom suffice.
+    if _torch.backends.mps.is_available() and "vjepa2" in model_name:
+        every = int(os.environ.get("TRIBE_MPS_EMPTY_EVERY", "4"))
+        _register_layer_empty_cache_hooks(model.model, every=every)
     _VIDEO_MODEL_CACHE[key] = model
     LAST_BACKBONE.update(hit=False, build_s=round(_time.perf_counter() - _t, 2))
     logger.info(
