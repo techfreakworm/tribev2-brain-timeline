@@ -1,7 +1,7 @@
 # Local long-video Quality scoring on Apple-silicon (MPS) — Design
 
 **Date:** 2026-06-23
-**Status:** Approved (brainstorm) — pending tribe-brain spec review + operator spec review
+**Status:** Approved (brainstorm); tribe-brain spec review incorporated (SHIP-with-revisions: ASR `0it` re-diagnosed, WIN-1 verify-first, hook path + double-registration guard, uniq_pv fp32, P4 split out) — pending operator spec review
 **Authors:** Mayank Gupta (operator), with tribe-brain (review/brainstorm)
 
 ## 1. Problem & goal
@@ -40,8 +40,9 @@ graph, flushing each clip's output to a small numpy row (~82 KB; a 3-min timelin
 but not more memory.
 
 **One length-dependent caveat:** `uniq_pv` (`fast_encode.py:253`) holds *all* unique
-prepped frames for the event on-device through the clip loop — ~2.3 GB fp32 /
-~1.1 GB bf16 at 3 min (~16 unique frames/s). Fine to ~3 min under an 80 GB budget;
+prepped frames for the event on-device through the clip loop — **~2.3 GB fp32** at
+3 min (~16 unique frames/s). NB: it is created outside the autocast ctx (`.to(dev)`,
+no dtype cast) so it is **fp32, not bf16**. Fine to ~3 min under an 80 GB budget;
 would need chunking only at ~10 min+. **Flagged, not blocking.**
 
 ## 3. Approaches considered
@@ -92,13 +93,27 @@ So free RAM is used to **stay safe** (the governor) and **shave overhead** (cade
 
 ## 5. Component design (phased)
 
-Phases are ordered by dependency: each needs the prior to validate.
+P1 is the enabler and comes first. But the dependency is looser than strict
+sequence: **P3 (pure-numpy seam fix) can be developed and unit-tested in parallel
+with P1** (only end-to-end validation needs P1), and **the P2 ASR diagnosis spike is
+independent of the memory work** and should run early. **P4 is out of scope for the
+first implementation plan** (explicitly optional speed work). The implementation plan
+covers **P1–P3**.
 
 ### Phase 1 — Runs safely (the enabler)
-- **Per-layer `empty_cache` hook:** register a `forward_hook` on each of the 40
-  VJEPA2 encoder layers (in `_dedup_get_data`, after `build_video_model` returns the
-  model) that calls `torch.mps.synchronize(); torch.mps.empty_cache()`. MPS-only
-  (gated on `_mps`); idempotent (guard attr like existing patches); no-op on CUDA.
+- **Per-layer `empty_cache` hook:** register a `forward_hook` that calls
+  `torch.mps.synchronize(); torch.mps.empty_cache()` on each of the **40 VJEPA2
+  *encoder* layers** — NOT the predictor (`modeling_vjepa2.py:618`) or pooler
+  self-attention (`:952`) `.layer` lists. The encoder list is
+  `model.model.encoder.layer` (an `nn.ModuleList`, `modeling_vjepa2.py:465`), but the
+  HF model is wrapped inside `_HFVideoModel.model`, so the **robust** registration is
+  to iterate `model.modules()` and hook instances of the per-layer block class rather
+  than hard-coding the attribute path. MPS-only (gated on `_mps`); no-op on CUDA.
+  - **★ Double-registration trap:** the model is cached in `_VIDEO_MODEL_CACHE`
+    across Score runs, so the idempotency guard MUST be a flag set **on the cached
+    model/layer objects** (e.g. a `_tribescore_layerhook` attr), NOT a module-level
+    flag — otherwise hooks stack on each run → compounding `synchronize`/`empty_cache`
+    slowdown.
 - **Fixed cadence** `TRIBE_MPS_EMPTY_EVERY` (default **4**) — fire every K-th layer
   to cap sync overhead. K=1 is the safety setting. Keep the existing per-clip free.
 - **Keep bf16 autocast** (`fast_encode.py:208`) — do **not** switch to native
@@ -118,26 +133,51 @@ Phases are ordered by dependency: each needs the prior to validate.
 
 ### Phase 2 — Quality path on MPS
 - whisperx ASR (already int8-patched for CPU/MPS via `mps.py`) on the 2–3 min audio;
-  **Llama-3.2-3B** coerced to MPS (existing `mps.py` device coercion). Both wired;
-  main work is **verifying the combined memory budget** holds with V-JEPA2 +
-  W2V-BERT + Llama resident (they run at different phases, but Llama stays loaded).
-- **Fix the audio→ASR-for-video chain.** On HF, a video/quality run showed
-  `Extract audio from video events: 1/1` then `Extracting words from audio: 0it` →
-  `No transcripts found` → **both audio AND text extractors dropped** → video-only
-  scoring despite Quality. If this is general (not video-specific), local Quality
-  would also silently drop to video-only. **Investigate the video→audio-chunking→
-  ASR chain so Word events reach Llama.** (Audio-*mode* Quality already works
-  locally, so the bug is likely in the video→audio extraction/chunking step.)
+  **Llama-3.2-3B** coerced to MPS (existing `mps.py` device coercion). Both are
+  already wired (audio-mode Quality works locally). Main work is **verifying the
+  combined memory budget** — see the §6 note on whether Llama is resident
+  *concurrently* with V-JEPA2 or freed between extractor phases (the concurrent
+  figure is conservative if they're not co-resident).
+- **The audio→ASR `0it` drop — DIAGNOSE FIRST, do not pre-commit a code change.**
+  On HF a video/quality run showed `Extract audio from video events: 1/1` then
+  `Extracting words from audio: 0it` → both audio AND text extractors dropped →
+  video-only despite Quality. **Root-cause traced in code:** `_split`
+  (`etypes.py:452-466`) always yields ≥1 chunk (`min_duration` only filters
+  *intermediate* split points; a 95 s audio → `[0,60]`+`[60,95]` = 2 chunks), and
+  frequency is auto-detected (`Audio.model_post_init`, `etypes.py:562-564`) — so
+  **ChunkEvents/`min_duration` is NOT the cause.** `0it` = zero `type=="Audio"`
+  rows reach `ExtractWordsFromAudio`, and the only path for that is
+  `ExtractAudioFromVideo`'s `if not audio: continue` (`audio.py:46-49`) — **the
+  video had no audio track** (moviepy `.audio is None`). Audio-mode Quality works
+  and shares ChunkEvents/whisperx/Llama, confirming the differentiator is the
+  video→audio extraction step, not the shared chain.
+  - **Phase-2 first task = a ~5-min diagnosis spike:** `ffprobe` the failing test
+    video for an audio stream; dump the events df right after `ExtractAudioFromVideo`.
+  - **Most likely outcome:** the test clip had no/empty audio → re-test with a real
+    speech video, and add a clear **"no speech track → scored video-only"** UI
+    message (graceful, not silent).
+  - **Code fix only** if extraction genuinely fails on a video *with* valid audio
+    (then the fix is in `ExtractAudioFromVideo`, not `ChunkEvents`).
 
-### Phase 3 — WIN-1 seam fix (correctness for >150 s)
-- Normalize `windowing.stitch` crossfade weights over the overlap band so multi-
-  window timelines don't show the ~22× seam discontinuity. **2–3 min videos cross
-  this every time** — required for a correct long-video timeline. Independent of
-  memory; bounding memory makes it *run*, this makes it *correct*.
+### Phase 3 — WIN-1 seam fix (correctness for >150 s) — VERIFY ROOT CAUSE FIRST
+The ~22× seam discontinuity on >150 s clips must be fixed for a correct long-video
+timeline, but **the cause is not yet confirmed and the obvious fix is likely wrong:**
+- `windowing.stitch` **already weight-sum-normalizes** the crossfade
+  (`windowing.py:271-273`, `accum / weight_sum`), so "normalize the crossfade
+  weights" would change nothing.
+- z-scored data is ~unit variance (±3), so a **~22×** step is far more consistent
+  with a **degenerate per-window z-score** — `(x-mean)/(std+1e-6)` (`windowing.py:313`)
+  blows up when a window's parcel signal is near-constant (std≈0).
+- **First task:** instrument per-window `std` + `weight_sum` at the failing seam on
+  a real >150 s clip. Fix the *actual* cause (most likely: guard the z-score against
+  near-zero std — larger epsilon, or skip/flag degenerate windows), not the
+  crossfade. Independent of memory; can be developed/tested against the existing
+  synthetic-seam unit tests in **parallel** with Phase 1 (only end-to-end validation
+  needs P1).
 
-### Phase 4 — Adaptive speed tiering (optional, deferred)
-- Only after Phase 1 runs and is parity-validated. The operator's "use free RAM"
-  speed layer, honestly ~1.3–1.5×:
+### Phase 4 — Adaptive speed tiering (OUT OF SCOPE for the first plan)
+- Deferred to a separate plan. Only after P1–P3 run and are parity-validated. The
+  operator's "use free RAM" speed layer, honestly ~1.3–1.5×:
   - **Headroom-tiered cadence `E`:** `H≥40 → off` (rely on watermark, fastest);
     `25–40 → every 8`; `15–25 → every 4`; `<15 → every layer + drop HIGH→0.4`.
   - **Prefetch depth `P` = clamp(H/2GB, 0, 2)** cross-window (decode window N+1 while
@@ -152,11 +192,11 @@ Phases are ordered by dependency: each needs the prior to validate.
 |---|---|---|
 | Baseline system (OS + app + other) | ~20–25 GB | machine-state-dependent; the governor measures it |
 | V-JEPA2 per-clip (A+B, bf16) | ~20–30 GB peak | the dominant transient; per-clip, length-independent |
-| `uniq_pv` (per-video) | ~1.1 GB bf16 | resident under every clip; grows with length |
-| Llama-3.2-3B (MPS, bf16) | ~6–8 GB | resident once loaded |
+| `uniq_pv` (per-video) | ~2.3 GB **fp32** | resident under every clip; grows with length |
+| Llama-3.2-3B (MPS, bf16) | ~6–8 GB | **verify resident concurrency** — `inference.py` CONFIG implies backbones may load→extract→free one at a time; if Llama is NOT co-resident with V-JEPA2, the concurrent figure is conservative |
 | W2V-BERT audio | ~few GB | transient |
 | whisperx (uvx subprocess, int8) | ~few GB | separate process, ASR phase only |
-| **Worst-case concurrent peak** | **~55–65 GB system** | under the 90 GB target with margin |
+| **Worst-case concurrent peak** | **~55–65 GB system** | under the 90 GB target with margin (conservative if Llama is freed before the video pass) |
 
 The `vm_stat` governor is the authority that protects the OS; the watermark only
 bounds the MPS pool. Keep both.
@@ -188,8 +228,17 @@ All from `~/Projects/tests` (scripts + venv), **never** the repo root.
 
 ## 9. Open items for implementation
 
-- Locate the VJEPA2 encoder layer `ModuleList` on the `transformers` model object
-  for hook registration (encoder `.layer` / `.blocks`).
-- Confirm MPS autocast softmax policy (parity nuance).
-- Determine whether the audio→ASR `0it` drop is video-specific or general before
-  scoping the Phase-2 fix.
+Resolved during spec review (tribe-brain):
+- **Hook attach point — resolved:** the VJEPA2 *encoder* layers (`model.model.encoder.layer`,
+  `nn.ModuleList` of 40). Register via `model.modules()` instance check; guard
+  idempotency on the cached model object (§5 Phase 1).
+- **`0it` ASR drop — re-diagnosed:** most likely the test video had **no audio track**
+  (`ExtractAudioFromVideo: if not audio: continue`), NOT a ChunkEvents/`min_duration`
+  bug. Confirm with the Phase-2 `ffprobe` spike before any code change.
+
+Still open (resolve during implementation):
+- Confirm MPS autocast softmax/LayerNorm policy (parity nuance — empirical test 2).
+- Confirm whether Llama-3.2-3B is resident **concurrently** with V-JEPA2 or freed
+  between extractor phases (affects the §6 concurrent budget; conservative either way).
+- Confirm the C-fallback prerequisite if ever adopted: VJEPA2 attention has no
+  additive/per-pair bias.
