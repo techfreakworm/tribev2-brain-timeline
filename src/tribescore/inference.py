@@ -343,6 +343,16 @@ def run_inference(
         except Exception:
             pass
 
+    # Full-multimodal run with no transcribed speech → flag it so the UI can say so
+    # (e.g. the video has no audio track). Quality silently degrades to video-only
+    # otherwise. Best-effort.
+    if out_info is not None and not audio_only:
+        try:
+            if int((events["type"] == "Word").sum()) == 0:
+                out_info["no_speech"] = True
+        except Exception:
+            pass
+
     preds, segments = model.predict(events)
     preds = np.asarray(preds, dtype=float)
     abs_times = np.array([round(seg.start) for seg in segments], dtype=float)

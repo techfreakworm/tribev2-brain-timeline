@@ -272,7 +272,7 @@ def _gpu_infer(mode: str, src_path: str, audio_only: bool):
             logger.info("PEAK_VRAM_GB=%.2f", _torch.cuda.max_memory_allocated() / 1e9)
     except Exception:
         pass
-    return preds, abs_times, info.get("media_path")
+    return preds, abs_times, info.get("media_path"), bool(info.get("no_speech"))
 
 
 # --- helpers ----------------------------------------------------------------
@@ -417,7 +417,7 @@ def _score_impl(mode, src_path, selected_names, audio_only, progress):
                 return _fail("Enter some text to score.")
 
         progress(0.15, desc="Running tribev2 on ZeroGPU (feature extraction + prediction)…")
-        preds, abs_times, text_media = _gpu_infer(mode, src_path, bool(audio_only))
+        preds, abs_times, text_media, no_speech = _gpu_infer(mode, src_path, bool(audio_only))
 
         if preds.shape[0] == 0:
             return _fail(
@@ -447,6 +447,12 @@ def _score_impl(mode, src_path, selected_names, audio_only, progress):
             for n, s in stats.items()
         }
         summary_str = ui.summary_html(stats_html)
+        if no_speech:
+            summary_str = (
+                '<div class="co-notice">⚠ No speech track detected — scored on '
+                'video + audio only (Language/semantic-load not from speech).</div>'
+                + summary_str
+            )
 
         progress(1.0, desc="Done.")
         # Text mode previews the synthesized speech the model actually scored (so a
