@@ -101,44 +101,61 @@ def _register_layer_empty_cache_hooks(hf_model, every: int) -> int:
     return n
 
 
+#: The stock VJEPA2 ``eager_attention_forward``, captured before we patch it, so the
+#: blocked path can delegate every edge case (mask / causal / dropout / training /
+#: small-N, and any non-encoder attention the module-global patch also touches —
+#: predictor / pooler) to it for guaranteed parity.
+_ORIG_EAGER_ATTN = None
+
+
 def _blocked_eager_attention_forward(module, query, key, value, attention_mask, scaling,
                                      dropout=0.0, **kwargs):
     """Query-blocked equivalent of VJEPA2's eager_attention_forward — never
-    materializes the (B,H,N,N) score matrix. Math-identical (RoPE already applied to
-    q,k; bidirectional, no causal/additive bias; softmax over keys). Returns None for
-    attention weights (the caller uses them only when output_attentions=True, which
-    the dedup path does not). MPS-only via the build_video_model gate."""
+    materializes the (B,H,N,N) score matrix. Math-identical for the hot path (RoPE
+    already applied to q,k upstream; bidirectional, no causal/additive bias; softmax
+    over the full key axis per query block; output_attentions unused by the dedup, so
+    weights are returned as None). Any edge case (mask, causal, dropout, training, or
+    N <= block) delegates to the stock fn for exact parity. MPS-only via the
+    build_video_model gate."""
     import torch as _torch
     import torch.nn.functional as _F
     n = query.shape[-2]
-    block = int(os.environ.get("TRIBE_ATTN_BLOCK", "512"))
+    block = int(os.environ.get("TRIBE_ATTN_BLOCK", "1024"))
+    is_causal = kwargs.get("is_causal", False)
+    if _ORIG_EAGER_ATTN is not None and (
+        attention_mask is not None or is_causal or dropout
+        or getattr(module, "training", False) or n <= block
+    ):
+        return _ORIG_EAGER_ATTN(module, query, key, value, attention_mask,
+                                scaling=scaling, dropout=dropout, **kwargs)
     kT = key.transpose(-1, -2)
     chunks = []
     for i in range(0, n, block):
         q = query[:, :, i:i + block, :]
         w = _torch.matmul(q, kT) * scaling
         w = _F.softmax(w, dim=-1, dtype=_torch.float32).to(query.dtype)
-        if dropout:
-            w = _F.dropout(w, p=dropout, training=module.training)
-        if attention_mask is not None:
-            w = w * attention_mask[..., i:i + block, :]
         chunks.append(_torch.matmul(w, value))
+        del w
     attn_output = _torch.cat(chunks, dim=2).transpose(1, 2).contiguous()
     return attn_output, None
 
 
 def _apply_blocked_attention() -> bool:
     """Monkeypatch VJEPA2's module-level eager_attention_forward with the blocked
-    version (the forward reads it as a global at call time). Idempotent. MPS-only."""
+    version (the forward reads it as a global at call time). Captures the stock fn
+    first for the edge-case fallback. Idempotent. MPS-only."""
+    global _ORIG_EAGER_ATTN
     try:
         import transformers.models.vjepa2.modeling_vjepa2 as _m
     except Exception:
         return False
     if getattr(_m, "_tribescore_blocked_attn", False):
         return True
+    _ORIG_EAGER_ATTN = _m.eager_attention_forward
     _m.eager_attention_forward = _blocked_eager_attention_forward
     _m._tribescore_blocked_attn = True
-    logger.info("applied blocked V-JEPA2 attention (query-block streaming)")
+    logger.info("applied blocked V-JEPA2 attention (query-block streaming, BLOCK=%s, stock fallback)",
+                os.environ.get("TRIBE_ATTN_BLOCK", "1024"))
     return True
 
 
