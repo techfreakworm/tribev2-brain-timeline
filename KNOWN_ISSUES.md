@@ -55,6 +55,15 @@ release). Local audio/text run fully on MPS; **local video is HF-only** (see Gap
   baked HF cache to a writable dir before `import gradio` (so gated runtime downloads
   don't `EACCES`). Free, but adds ~1–2 min to cold starts. A build-time alternative is
   under Future.
+- **Frame-dedup multi-window parity not re-validated (long video).** Frame-dedup
+  (`TRIBE_DEDUP`, **ON** by default — opt out with `TRIBE_NO_DEDUP=1`) is GPU-validated
+  numerically exact (max|Δ|=0) and confirmed on the video/quality billed run — but on a
+  single-window (15 s) clip. A dedicated **≥150 s multi-window A/B parity** check
+  (`profile_validate_dedup`, removed with the profiler harness) has not been re-run, so
+  the long-video case isn't formally closed. The dedup-output-cache (`TRIBE_DEDUP_CACHE`)
+  is **OFF** by default and stays off pending that check. For guaranteed native-path
+  correctness on long videos, set `TRIBE_NO_DEDUP=1` (slower / more quota, no dedup
+  indexing risk).
 - **Absolute scores are not interpretable.** The model target was per-sample z-scored,
   so only **relative temporal dynamics** are meaningful (already stated in the UI).
 - **Virality is a cortical-only research proxy** (no ventral striatum / NAcc) — a
