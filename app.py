@@ -34,7 +34,7 @@ os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 # (bounds the peak); the HIGH ratio is a catchable hard cap (raises a RuntimeError we
 # surface as "input too large" instead of crashing). MPS-only -> no-op on CUDA/ZeroGPU.
 os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.3")
-os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.6")
+os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.45")
 
 # Writable HF cache — MUST run BEFORE `import gradio` (line below), because gradio
 # imports huggingface_hub, which FREEZES HF_HUB_CACHE (= $HF_HOME/hub) AND

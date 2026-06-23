@@ -303,6 +303,11 @@ def apply_frame_dedup_encode() -> bool:
                 _tf = _time.perf_counter()
                 _mps = torch.backends.mps.is_available()
                 output = np.array([])
+                # B=1 is intentional and load-bearing: V-JEPA2 ViT-g is
+                # compute-bound and ONE 8192-token clip already over-saturates the
+                # GPU (measured: B=4 ≈ 231 s vs B=1 bf16 ≈ 173 s on CUDA; the M5 Max
+                # 40-core GPU saturates even harder). Batching clips adds memory with
+                # NO throughput gain — do not "optimize" this into a batched forward.
                 for k, ts_list in enumerate(clip_ts):
                     sel = [idx_of[_key(ts)] for ts in ts_list]
                     clip_pv = uniq_pv[sel].unsqueeze(0)  # (1, num_frames, 3, H, W)
