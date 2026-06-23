@@ -55,15 +55,21 @@ release). Local audio/text run fully on MPS; **local video is HF-only** (see Gap
   baked HF cache to a writable dir before `import gradio` (so gated runtime downloads
   don't `EACCES`). Free, but adds ~1–2 min to cold starts. A build-time alternative is
   under Future.
-- **Frame-dedup multi-window parity not re-validated (long video).** Frame-dedup
+- **Frame-dedup ≥150 s multi-window parity not formally re-run (low risk).** Frame-dedup
   (`TRIBE_DEDUP`, **ON** by default — opt out with `TRIBE_NO_DEDUP=1`) is GPU-validated
-  numerically exact (max|Δ|=0) and confirmed on the video/quality billed run — but on a
-  single-window (15 s) clip. A dedicated **≥150 s multi-window A/B parity** check
-  (`profile_validate_dedup`, removed with the profiler harness) has not been re-run, so
-  the long-video case isn't formally closed. The dedup-output-cache (`TRIBE_DEDUP_CACHE`)
-  is **OFF** by default and stays off pending that check. For guaranteed native-path
-  correctness on long videos, set `TRIBE_NO_DEDUP=1` (slower / more quota, no dedup
-  indexing risk).
+  numerically exact (max|Δ|=0) and confirmed on the video/quality billed run, but on a
+  single-window (15 s) clip. Why this is **low-probability, not a live break**: the
+  original multi-window concern was the dedup *output-cache* key omitting duration — and
+  `TRIBE_DEDUP_CACHE` is **OFF** by default (unset on the Space), so that interaction
+  can't occur. With dedup-on / cache-off, scoring reduces to N *independent* per-window
+  frame extractions, each covered by the max|Δ|=0 validation (the dedup copies the
+  original's times/expect-frames formula verbatim), and the `round(ts, 6)` unique-frame
+  key is float64-precision-robust at ts ≈ 150 s (≫ 6-decimal rounding → no spurious
+  late-window frame merge). *Cheap way to formally close it later* (no profiler needed):
+  A/B one ≥150 s clip — `TRIBE_NO_DEDUP=1` (native) vs default (dedup) — and diff the
+  output curves; expect max|Δ| ≈ 0. That's a **billed Space run**, so it's operator-gated.
+  For guaranteed native-path correctness on long videos meanwhile, set `TRIBE_NO_DEDUP=1`
+  (slower / more quota, no dedup indexing risk).
 - **Absolute scores are not interpretable.** The model target was per-sample z-scored,
   so only **relative temporal dynamics** are meaningful (already stated in the UI).
 - **Virality is a cortical-only research proxy** (no ventral striatum / NAcc) — a
