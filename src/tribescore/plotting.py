@@ -218,47 +218,103 @@ def seek_js(video_id: str = "tm-video", plot_elem_id: str = "co-timeline") -> st
     ``demo.load(js=...)`` or a component's ``.then(js=...)`` without this module
     importing Gradio. Pure function -- depends only on its arguments.
     """
-    return f"""
-() => {{
-    const PLOT_ID = {plot_elem_id!r};
-    const VIDEO_ID = {video_id!r};
-    const bind = () => {{
+    js = r"""
+() => {
+    const PLOT_ID = "__PLOT_ID__";
+    const VIDEO_ID = "__VIDEO_ID__";
+    const LINE = { color: "#36D1C4", width: 1.5, dash: "solid" };
+
+    // One resolver, used by both binds (the gd is stable across a Score:
+    // Gradio re-plots in place via Plotly.react on the same div).
+    const resolveGd = () => {
         const host = document.getElementById(PLOT_ID);
-        if (!host) return false;
-        // Gradio wraps Plotly in a .js-plotly-plot div.
-        const gd = host.querySelector('.js-plotly-plot') || host;
-        if (!gd || !gd.on) return false;
-        if (gd.dataset.coSeekBound === '1') return true;
-        gd.dataset.coSeekBound = '1';
-        gd.on('plotly_click', (ev) => {{
+        if (!host) return null;
+        const gd = host.querySelector(".js-plotly-plot") || host;
+        return (gd && gd.on) ? gd : null;
+    };
+    // Plotly.react clears layout.shapes on every Score, so always create-or-move.
+    const ensureShape = (gd) => {
+        if (!window.Plotly) return;
+        const shapes = (gd.layout && gd.layout.shapes) || [];
+        if (!shapes.length) {
+            window.Plotly.relayout(gd, { shapes: [{
+                type: "line", xref: "x", yref: "paper",
+                x0: 0, x1: 0, y0: 0, y1: 1, line: LINE
+            }]});
+        }
+    };
+    const movePlayhead = (gd, t) => {
+        if (!window.Plotly || !Number.isFinite(t)) return;
+        ensureShape(gd);
+        window.Plotly.relayout(gd, { "shapes[0].x0": t, "shapes[0].x1": t });
+    };
+
+    // Click a spike -> seek the video + set the playhead start position.
+    const bindClick = () => {
+        const gd = resolveGd();
+        if (!gd) return false;
+        if (gd.dataset.coSeekBound === "1") return true;
+        gd.dataset.coSeekBound = "1";
+        gd.on("plotly_click", (ev) => {
             if (!ev || !ev.points || !ev.points.length) return;
             const t = ev.points[0].x;
             const v = document.getElementById(VIDEO_ID);
-            if (v && Number.isFinite(t)) {{
-                try {{ v.currentTime = t; v.play && v.play().catch(() => {{}}); }} catch (e) {{}}
-            }}
-            // Best-effort: draw/move a playhead line at the clicked second.
-            try {{
-                if (window.Plotly && Number.isFinite(t)) {{
-                    window.Plotly.relayout(gd, {{
-                        'shapes': [{{
-                            type: 'line', xref: 'x', yref: 'paper',
-                            x0: t, x1: t, y0: 0, y1: 1,
-                            line: {{ color: '#36D1C4', width: 1.5, dash: 'solid' }}
-                        }}]
-                    }});
-                }}
-            }} catch (e) {{}}
-        }});
+            if (v && Number.isFinite(t)) {
+                try { v.currentTime = t; v.play && v.play().catch(() => {}); } catch (e) {}
+            }
+            try { movePlayhead(gd, t); } catch (e) {}
+        });
         return true;
-    }};
-    // Retry briefly: the Plotly div may mount a tick after the callback fires.
-    if (!bind()) {{
+    };
+
+    // Playhead follows playback: a rAF loop moves shapes[0] to currentTime,
+    // gated to ~30Hz, with a single global rafId so a re-Score never leaves two
+    // loops fighting over the shared gd.
+    const bindPlayhead = () => {
+        const v = document.getElementById(VIDEO_ID);
+        const gd = resolveGd();
+        if (!v || !gd || !window.Plotly) return false;
+        if (v.dataset.coPlayheadBound === "1") return true;
+        v.dataset.coPlayheadBound = "1";
+        cancelAnimationFrame(window.__coPlayheadRaf);  // kill any prior loop
+        let lastX = -1;
+        const loop = () => {
+            const t = v.currentTime;
+            if (Number.isFinite(t) && Math.abs(t - lastX) >= 0.03) {
+                lastX = t;
+                try { movePlayhead(gd, t); }
+                catch (e) { cancelAnimationFrame(window.__coPlayheadRaf); return; }
+            }
+            if (!v.paused && !v.ended) window.__coPlayheadRaf = requestAnimationFrame(loop);
+        };
+        const start = () => {
+            cancelAnimationFrame(window.__coPlayheadRaf);
+            window.__coPlayheadRaf = requestAnimationFrame(loop);
+        };
+        v.addEventListener("play", () => { try { ensureShape(gd); } catch (e) {} start(); });
+        v.addEventListener("pause", () => {
+            cancelAnimationFrame(window.__coPlayheadRaf);
+            try { movePlayhead(gd, v.currentTime); } catch (e) {}
+        });
+        v.addEventListener("seeked", () => { try { movePlayhead(gd, v.currentTime); } catch (e) {} });
+        v.addEventListener("ended", () => cancelAnimationFrame(window.__coPlayheadRaf));
+        return true;
+    };
+
+    // Retry until BOTH bind — the <video> may mount a tick after the plot div.
+    let okClick = false, okHead = false;
+    const tryBind = () => {
+        if (!okClick) okClick = bindClick();
+        if (!okHead) okHead = bindPlayhead();
+        return okClick && okHead;
+    };
+    if (!tryBind()) {
         let n = 0;
-        const id = setInterval(() => {{ if (bind() || ++n > 40) clearInterval(id); }}, 100);
-    }}
-}}
+        const id = setInterval(() => { if (tryBind() || ++n > 40) clearInterval(id); }, 100);
+    }
+}
 """.strip()
+    return js.replace("__PLOT_ID__", plot_elem_id).replace("__VIDEO_ID__", video_id)
 
 
 # ---------------------------------------------------------------------------
