@@ -1,6 +1,6 @@
 # Design: chunk the frame `processor()` call to bound the memory transient
 
-**Branch:** `feat/local-mps-quality-video`  ·  **Status:** for tribe-brain feasibility review
+**Branch:** `feat/local-mps-quality-video`  ·  **Status:** ✅ implemented (6a7f0c3) + live-verified 2026-06-24
 
 ## Problem (measured)
 
@@ -56,3 +56,21 @@ uniq_frames.clear()                                 # free the ~11 GB CPU list b
 
 Goal: let the operator score full-res long reels (neeraj_reel_2, 71 s 720×1280) under the 90 GB watchdog
 without downscaling. Reason deeply (sequential-thinking); give a decisive feasibility verdict + must-fixes.
+
+## Verification (2026-06-24)
+
+tribe-brain verdict: **ship it** — Q1 confirmed BIT-IDENTICAL from the transformers source (VJEPA2 processor is
+per-frame spatial; `do_sample_frames` off; no temporal op / no batch-computed stats). All 6 must-fixes applied
+in 6a7f0c3 (incremental free, resolution-adaptive chunk size, in-loop memguard, `_fix_pixel_values` confirmed
+per-frame NaN-guard / no-op on the video key).
+
+Live run — **full-res `neeraj_reel_2.mp4` (720×1280, 70.8 s, ~2124 frames), Fast mode, cache-off:**
+- **Peak 63.2 GB** (external watchdog) — vs ~96 GB on the single-call path; never neared the 90 GB ceiling or
+  the 105 GB OS gate. Memory oscillated 44–63 GB through 142 clips × 2 passes.
+- Completed in ~32 min: `Predicted 71/100 segments`. Output **72-row CSV, real z-scored curves, 0 NaN** —
+  rendered cleanly in the UI.
+- Bonus: the three UX fixes (button-lock, `pass p/N` label, save+download curves) all verified in the same run.
+
+Result: the full-res long-reel goal is met with zero output change. Next-step options: rigorous empirical
+bit-identical gate (11 s reel chunked vs `TRIBE_PROC_CHUNK=huge` single-call, compare CSVs == 0), and a
+cache-on re-test (the chunk fix removes the transient, so cache-on should also sit ~60 GB).
