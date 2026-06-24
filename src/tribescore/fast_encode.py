@@ -302,10 +302,14 @@ def apply_frame_dedup_encode() -> bool:
             yield from _orig.__get__(self, type(self))(events)
             return
         # Output cache (opt-in via TRIBE_DEDUP_CACHE; default OFF until the
-        # multi-window parity gate passes). Key = filepath + extractor CONFIG, NO
-        # duration: the loader's per-window __call__ passes a WINDOWED event (its
-        # duration is the window, not the full clip), so a duration key would miss;
-        # one file+config = one full extraction, sliced downstream per window.
+        # multi-window parity gate passes). The loader calls _get_data with the
+        # FULL-clip event for every segment (neuralset _get_timed_arrays slices the
+        # window downstream via ta.overlap(start, duration)), so one file+config =
+        # one full extraction reused across that Score's windows. Key = filepath +
+        # event offset+duration + extractor CONFIG: offset/duration are constant for
+        # the full event (reuse preserved) AND make the key safe by construction —
+        # if a windowed event ever reached here it would key differently -> miss ->
+        # re-extract, never a silent wrong slice. (See the offset/duration note below.)
         cache_on = bool(os.environ.get("TRIBE_DEDUP_CACHE"))
         ckeys = []
         for _ev in events:
