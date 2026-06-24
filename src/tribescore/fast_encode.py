@@ -408,12 +408,42 @@ def apply_frame_dedup_encode() -> bool:
                 video.close()
                 t_decode = _time.perf_counter() - _td
 
-                # Process ALL unique frames in ONE call as a single U-frame "video"
-                # (per-frame spatial only -> identical to per-clip processing).
+                # Process unique frames in CHUNKS (not all-at-once) to bound the
+                # resize/normalize transient. The single-call version peaked ~96GB on a
+                # 71s 720x1280 clip (the per-CLIP memguard runs LATER and can't see this
+                # within-prep transient -> only the external watchdog caught it). The
+                # VJEPA2 processor is per-frame spatial (resize+center_crop(256)+normalize,
+                # fixed params, no temporal op / no frame sampling -- verified vs
+                # transformers), so cat([processor(chunk_i)]) == processor(all) is
+                # BIT-IDENTICAL: no output change, Space parity preserved.
                 _tp = _time.perf_counter()
-                inputs = model.processor(videos=[np.array(uniq_frames)], return_tensors="pt")
-                _fix_pixel_values(inputs)
-                uniq_pv = inputs["pixel_values_videos"][0].to(dev)  # (U, 3, H, W)
+                U = len(uniq_frames)
+                _hw = (uniq_frames[0].shape[0] * uniq_frames[0].shape[1]) if U else 1
+                # Resolution-adaptive chunk: keep the per-chunk fp32 transient ~<=3GB
+                # (~CHUNK * H*W*12 bytes -> 256 at 720p, ~30 at 4K). Manual override via
+                # TRIBE_PROC_CHUNK (set huge to reproduce the old single-call path).
+                _ov = os.environ.get("TRIBE_PROC_CHUNK")
+                _chunk = max(1, int(_ov)) if _ov else int(min(256, max(16, (3 * 1024 ** 3) // max(1, _hw * 12))))
+                _parts = []
+                for _i in range(0, U, _chunk):
+                    _inp = model.processor(
+                        videos=[np.array(uniq_frames[_i:_i + _chunk])], return_tensors="pt"
+                    )
+                    _fix_pixel_values(_inp)
+                    _parts.append(_inp["pixel_values_videos"][0])  # (n, 3, 256, 256)
+                    del _inp
+                    # Incremental free: drop this chunk's raw frames so uniq_frames and
+                    # _parts don't both peak (the raw list is ~11GB+ for HD, O(len*res)).
+                    for _j in range(_i, min(_i + _chunk, U)):
+                        uniq_frames[_j] = None
+                    # In-loop memguard: graceful abort if this prep transient nears the
+                    # ceiling (the per-clip check below can't see it). Closes the gap
+                    # that previously needed an external kill -9.
+                    if torch.backends.mps.is_available():
+                        memguard.check_or_abort()
+                uniq_frames.clear()
+                uniq_pv = torch.cat(_parts, dim=0).to(dev)  # (U, 3, 256, 256)
+                del _parts
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 t_proc = _time.perf_counter() - _tp
