@@ -444,12 +444,16 @@ def _score_impl(mode, src_path, selected_names, audio_only, progress):
             fast_encode.clear_dedup_cache()
             cache_on = bool(os.environ.get("TRIBE_DEDUP_CACHE"))
             try:
-                # cache ON -> one extraction (the per-window predict calls all hit the
-                # cache) -> a single sink sweep -> n_pass=1 -> clean 0->100%.
-                # cache OFF -> the double-extract re-runs the loop, ~window-count sweeps.
-                n_pass = 1 if cache_on else (max(1, len(plan_windows(dur))) if dur and dur > 0 else 1)
+                # Encode "sweeps" = _dedup_get_data calls that actually extract (each is
+                # one 0..N sink pass). The parity run MEASURED the counts: there are two
+                # extraction contexts (fit + predict); within each, the per-window calls
+                # reuse via the cache. So cache ON = 2 sweeps (fit+predict each extract
+                # once); cache OFF = 2 x num_windows (no reuse). n_pass must match so the
+                # bar fills 0->100% cleanly instead of pinning at 100% on a later sweep.
+                nwin = max(1, len(plan_windows(dur))) if dur and dur > 0 else 1
+                n_pass = 2 if cache_on else (2 * nwin)
             except Exception:
-                n_pass = 1
+                n_pass = 2 if cache_on else 2
             # Option T: the encode sink writes per-clip counters into the live
             # state dict; a gr.Timer reads it and re-renders the loading card.
             progress_state.begin(n_pass)
