@@ -386,6 +386,58 @@ def _progress_tick():
     return ui.loading_card_html(snap)
 
 
+def _lock_btn():
+    """Disable a Score button at the START of its event chain so a second click
+    can't queue a phantom re-run (the queue is concurrency_limit=1, so a queued
+    2nd Score would fire the instant the 1st finishes)."""
+    return gr.update(interactive=False)
+
+
+def _unlock_btn():
+    """Re-enable the Score button at the END of the chain. Always runs because
+    _score_impl never raises (it wraps everything in try/except -> _fail)."""
+    return gr.update(interactive=True)
+
+
+def _save_curves(t_axis, curves, selected, src_path):
+    """Persist the scored curves (CSV + JSON) so a finished run isn't lost (the
+    app otherwise keeps nothing after rendering). Writes under tempdir (which is
+    in allowed_paths, so it's downloadable). Returns the CSV abs-path, or None."""
+    try:
+        import csv as _csv
+        import json as _json
+        import tempfile as _tf
+        from datetime import datetime as _dt
+
+        cols = [n for n in selected if n in curves]
+        if not cols or t_axis is None or len(t_axis) == 0:
+            return None
+        stem = (os.path.splitext(os.path.basename(str(src_path or "clip")))[0] or "clip")[:40]
+        ts = _dt.now().strftime("%Y%m%d-%H%M%S")
+        # Known dir (set by run_local + added to allowed_paths) so the operator's
+        # cross-reel study keeps history; tempdir fallback on the Space (ephemeral,
+        # but the in-session download still works). Must be under allowed_paths.
+        outdir = os.environ.get("TRIBESCORE_CURVES_DIR") or os.path.join(_tf.gettempdir(), "tribescore_curves")
+        os.makedirs(outdir, exist_ok=True)
+        base = os.path.join(outdir, f"tribescore_{stem}_{ts}")
+        with open(base + ".csv", "w", newline="") as f:
+            w = _csv.writer(f)
+            w.writerow(["t_s"] + cols)
+            for i, tv in enumerate(t_axis):
+                w.writerow([round(float(tv), 3)] + [round(float(curves[c][i]), 5) for c in cols])
+        with open(base + ".json", "w") as f:
+            _json.dump(
+                {"t_s": [round(float(tv), 3) for tv in t_axis],
+                 "curves": {c: [round(float(x), 5) for x in curves[c]] for c in cols}},
+                f,
+            )
+        logger.info("saved curves -> %s.csv", base)
+        return base + ".csv"
+    except Exception:
+        logger.exception("save curves failed (non-fatal)")
+        return None
+
+
 def _fail(message: str):
     """Error update tuple (same 7 outputs + trailing ok=False for _reveal_result)."""
     return (
@@ -502,6 +554,18 @@ def _score_impl(mode, src_path, selected_names, audio_only, progress):
                 + summary_str
             )
 
+        # Persist the curves (CSV+JSON) so a finished run isn't lost; offer a download.
+        _csv_path = _save_curves(t_axis, curves, selected_display, src_path)
+        if _csv_path:
+            from urllib.parse import quote
+            _href = "/gradio_api/file=" + quote(_csv_path)  # canonical 6.11 file route, relative
+            _fn = os.path.basename(_csv_path)
+            summary_str += (
+                '<div class="co-dl">&#11015; <a href="' + _href + '" download="' + _fn + '">'
+                'Download curves (CSV)</a>'
+                '<span class="co-dl-note"> &middot; saved — finished runs persist now</span></div>'
+            )
+
         progress(1.0, desc="Done.")
         # Text mode previews the synthesized speech the model actually scored (so a
         # spike-click can seek it), exactly like Audio mode. If the synthesized path
@@ -593,27 +657,39 @@ def build_demo() -> gr.Blocks:
         def _run_video(vid, metrics, ao, progress=gr.Progress()):
             return _score_impl("video", vid, metrics, ao, progress)
 
-        v["run_btn"].click(_enter_loading, None, loading_outputs).then(
+        v["run_btn"].click(_lock_btn, None, [v["run_btn"]], trigger_mode="once").then(
+            _enter_loading, None, loading_outputs
+        ).then(
             _run_video,
             inputs=[v["video"], v["metrics"], v["audio_only"]],
             outputs=score_outputs,
-        ).then(_reveal_result, inputs=[ok_state], outputs=[r["result_grp"]]).then(fn=None, js=js_seek)
+        ).then(_reveal_result, inputs=[ok_state], outputs=[r["result_grp"]]).then(
+            fn=None, js=js_seek
+        ).then(_unlock_btn, None, [v["run_btn"]])
 
         # --- Audio ---
-        a["run_btn"].click(_enter_loading, None, loading_outputs).then(
+        a["run_btn"].click(_lock_btn, None, [a["run_btn"]], trigger_mode="once").then(
+            _enter_loading, None, loading_outputs
+        ).then(
             lambda aud, metrics, ao, pr=gr.Progress(): _score_impl("audio", aud, metrics, ao, pr),
             inputs=[a["audio"], a["metrics"], a["audio_only"]],
             outputs=score_outputs,
-        ).then(_reveal_result, inputs=[ok_state], outputs=[r["result_grp"]]).then(fn=None, js=js_seek)
+        ).then(_reveal_result, inputs=[ok_state], outputs=[r["result_grp"]]).then(
+            fn=None, js=js_seek
+        ).then(_unlock_btn, None, [a["run_btn"]])
 
         # --- Text ---
-        t["run_btn"].click(_enter_loading, None, loading_outputs).then(
+        t["run_btn"].click(_lock_btn, None, [t["run_btn"]], trigger_mode="once").then(
+            _enter_loading, None, loading_outputs
+        ).then(
             lambda txt, metrics, pr=gr.Progress(): _score_impl(
                 "text", _text_to_tmp(txt[:MAX_TEXT_CHARS]) if txt else "", metrics, False, pr
             ),
             inputs=[t["text"], t["metrics"]],
             outputs=score_outputs,
-        ).then(_reveal_result, inputs=[ok_state], outputs=[r["result_grp"]]).then(fn=None, js=js_seek)
+        ).then(_reveal_result, inputs=[ok_state], outputs=[r["result_grp"]]).then(
+            fn=None, js=js_seek
+        ).then(_unlock_btn, None, [t["run_btn"]])
 
     return demo
 

@@ -289,9 +289,12 @@ def loading_card_html(snap: dict | None = None) -> str:
     within = (done / total) if total else 0.0
     frac = min(1.0, max(0.0, (pass_idx + within) / n))
     pct = int(round(frac * 100))
-    window = min(pass_idx + 1, n)
+    # n is the encode-PASS count (fit + predict sweeps, set by app.py from the
+    # cache state) -- NOT geometric windows. Label it "pass" so a 1-window clip
+    # doesn't confusingly read "window 1/2".
+    pass_no = min(pass_idx + 1, n)
     if total:
-        label = f"Encoding video &middot; clip {done}/{total} &middot; window {window}/{n}"
+        label = f"Encoding video &middot; clip {done}/{total} &middot; pass {pass_no}/{n}"
     else:
         label = "Extracting features and predicting cortical activity&hellip;"
     return (

@@ -410,6 +410,19 @@ CSS: str = """
     color: var(--co-amber);
     letter-spacing: 0.02em;
 }
+/* Download-curves link appended to the summary (finished runs persist). */
+.co-dl {
+    margin-top: 12px;
+    font-size: 13px;
+}
+.co-dl a {
+    color: var(--co-amber);
+    text-decoration: none;
+    font-weight: 600;
+    border-bottom: 1px solid rgba(255,180,84,0.4);
+}
+.co-dl a:hover { border-bottom-color: var(--co-amber); }
+.co-dl-note { color: var(--co-dim); font-weight: 400; }
 
 /* ---- Proxy / honesty caveat (the value-region disclaimer, §5) ----------- */
 .co-caveat {
