@@ -1,73 +1,62 @@
-"""Pure helpers for the determinate per-clip encode progress bar (Option X).
+"""Live per-clip progress state for the determinate in-card bar (Option T).
 
-The Gradio app (``app.py``) builds a per-clip *sink* here and registers it on
-:mod:`tribescore.fast_encode`; the V-JEPA2 encode loop then calls it once per
-clip with ``(done, total)``. The sink maps that into the overall progress bar
-and drives the native ``gr.Progress`` widget.
-
-These helpers are pure (the ``progress`` callback and the clock are injected),
-so they unit-test without importing the heavy Gradio app. Design + rationale:
+The native ``gr.Progress`` bar does NOT render in this app's loading-card layout
+(smoke-test confirmed: the sink fires but Gradio's status-tracker stays empty).
+So we drive the card's OWN HTML instead: the V-JEPA2 encode sink writes the
+per-clip counters into a module-global dict here, and a ``gr.Timer`` in app.py
+reads it ~3x/s and re-renders the loading card. tribe-brain-reviewed (Option T
+over the worker-thread generator: no manual MPS thread, no generator into the
+Gradio-6.11 visibility chain). Design doc:
 ``docs/superpowers/specs/2026-06-24-progress-bar-design.md``.
 
-LOCAL-ONLY: the sink is registered only on the in-process (Apple-silicon MPS)
-path. On the HF Space ``_gpu_infer`` runs in a forked ``@spaces.GPU`` subprocess
-that cannot see a parent-set sink, so the coarse stage progress is the Space
-fallback there (and :func:`fast_encode._emit_progress` no-ops when unset).
+LOCAL-ONLY: ``begin()`` is called only off-Space, so on the HF Space ``active``
+stays False, the Timer reads inactive → ``gr.skip()``, and the coarse stage
+``progress()`` calls remain the Space fallback. Plain int writes are GIL-atomic,
+so no lock is needed for the single-writer (encode) / single-reader (Timer) case.
 """
 from __future__ import annotations
 
-import time as _time
-
-# The V-JEPA2 encode occupies the 0.15->0.70 slice of the overall progress bar;
-# the stitch/metrics/render stages keep their existing 0.75/0.92/1.0 marks.
-ENCODE_LO: float = 0.15
-ENCODE_HI: float = 0.70
+#: Live state. ``active`` gates the Timer; ``done/total`` are clips within the
+#: current window; ``pass_idx`` is the 0-based window; ``n_pass`` the window
+#: count from ``plan_windows()``; ``_last`` tracks the per-window counter restart.
+_STATE = {"active": False, "done": 0, "total": 0, "pass_idx": 0, "n_pass": 1, "_last": 0}
 
 
-def encode_frac(pass_idx: int, done: int, total: int, n_pass: int) -> float:
-    """Monotonic map of (window pass, within-window clip) into the encode band.
+def begin(n_pass: int) -> None:
+    """Mark a video encode as starting and reset counters (call before _gpu_infer)."""
+    _STATE.update(active=True, done=0, total=0, pass_idx=0, n_pass=max(1, int(n_pass)), _last=0)
 
-    With the dedup output-cache OFF, tribev2 re-runs the encode loop once per
-    window, so the bar advances across ``n_pass`` windows without resetting:
-    ``frac = LO + (HI-LO) * (pass_idx + done/total) / n_pass``.
 
-    ``pass_idx`` is the 0-based window index; ``done``/``total`` are clips within
-    the current window; ``n_pass`` is the window count from ``plan_windows()``.
-    Clamped to ``[ENCODE_LO, ENCODE_HI]`` so an under-/over-estimated ``n_pass``
-    can never overshoot into the stitch band. Degrades cleanly to a single
-    0->100% sweep when ``n_pass == 1`` (e.g. once the output cache lands).
+def end() -> None:
+    """Mark the encode finished (call in a ``finally``)."""
+    _STATE["active"] = False
+
+
+def sink(done: int, total: int) -> None:
+    """Per-clip sink registered on ``fast_encode``. Detects a new window pass by
+    the per-window counter restart (``done`` returning to <= the last seen), so
+    the bar advances monotonically across windows with no reset. No throttle here
+    — the 0.3 s Timer is the throttle (it just samples whatever the last write was)."""
+    if done <= _STATE["_last"]:
+        _STATE["pass_idx"] += 1
+    _STATE["_last"] = int(done)
+    _STATE["done"] = int(done)
+    _STATE["total"] = int(total)
+
+
+def snapshot() -> dict:
+    """Return a shallow copy of the live state (for the Timer handler)."""
+    return dict(_STATE)
+
+
+def encode_frac(snap: dict | None = None) -> float:
+    """0..1 fraction of the whole multi-window encode from a snapshot.
+
+    ``frac = (pass_idx + done/total) / n_pass`` — monotonic across windows,
+    clamped to [0, 1]. Degrades to a single 0→1 sweep when ``n_pass == 1``.
     """
-    n_pass = max(1, n_pass)
-    within = (done / total) if total else 0.0
-    frac = ENCODE_LO + (ENCODE_HI - ENCODE_LO) * ((pass_idx + within) / n_pass)
-    return min(ENCODE_HI, max(ENCODE_LO, frac))
-
-
-def make_clip_sink(progress, n_pass: int, *, clock=None, min_interval: float = 0.4):
-    """Build a per-clip ``sink(done, total)`` for ``fast_encode.set_progress_sink``.
-
-    Tracks window passes by the per-window counter restart (``done`` returning to
-    a value <= the last seen), maps monotonically via :func:`encode_frac`, and
-    throttles UI updates to ``min_interval`` seconds — except the final clip of a
-    window (``done == total``), which always emits. ``progress`` is the
-    ``gr.Progress`` callable; ``clock`` is injectable for tests.
-    """
-    clock = clock or _time.monotonic
-    st = {"pass": 0, "last": 0, "t": -1e9}
-
-    def _sink(done: int, total: int) -> None:
-        # New extraction pass (next window) when the per-window counter restarts.
-        if done <= st["last"]:
-            st["pass"] += 1
-        st["last"] = done
-        now = clock()
-        if now - st["t"] < min_interval and done != total:
-            return  # throttle the UI update only; pass tracking already advanced
-        st["t"] = now
-        window = min(st["pass"] + 1, max(1, n_pass))
-        progress(
-            encode_frac(st["pass"], done, total, n_pass),
-            desc=f"Encoding video · clip {done}/{total} · window {window}/{max(1, n_pass)}",
-        )
-
-    return _sink
+    s = snap if snap is not None else _STATE
+    n = max(1, int(s.get("n_pass", 1) or 1))
+    total = int(s.get("total", 0) or 0)
+    within = (int(s.get("done", 0) or 0) / total) if total else 0.0
+    return min(1.0, max(0.0, (int(s.get("pass_idx", 0) or 0) + within) / n))

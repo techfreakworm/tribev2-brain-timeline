@@ -1,6 +1,61 @@
 # Design: real per-clip progress bar (replace the indeterminate "Scoring…" loader)
 
-**Branch:** `feat/local-mps-quality-video`  ·  **Status:** DECIDED → implemented; pending live smoke-test.
+**Branch:** `feat/local-mps-quality-video`  ·  **Status:** ✅ RESOLVED — Option T (gr.Timer-driven in-card bar) implemented + live-verified.
+
+## ✅ FINAL: Option T (gr.Timer) — implemented + verified (2026-06-24)
+
+Native bar (X) was dead (see below); tribe-brain ruled **Option T** over the worker-thread generator (Y).
+Implemented + live-smoke-tested on the 15 s clip:
+- Encode sink writes per-clip counters into `tribescore.progress._STATE`; a `gr.Timer(0.3)` reads it and
+  re-renders the `loading_body` card HTML (`ui.loading_card_html`).
+- **Timer ticks in parallel with the `concurrency_limit=1` Score** (per-concurrency-id queue) — VERIFIED:
+  card showed `Encoding video · clip 4/30 · window 1/1` at 13%, advancing per clip; bar amber, determinate.
+- After the Score: card hidden, no stuck bar, timeline + summary render cleanly (Timer → `gr.skip()` when idle).
+- Must-fixes applied: own concurrency lane, local-only `active` gate, `gr.skip()` when idle, Timer updates
+  only `loading_body` value (never container visibility → `.then(_reveal_result)`/6.11 workaround untouched),
+  no manual thread, sink reused (throttle is the 0.3 s Timer).
+- **Known cosmetic wart:** with the cache OFF the encode double-extracts, so on a 1-window clip the bar fills
+  0→100% then sits at 100% during the 2nd pass. On ≥2-window clips the 2 extract-passes map onto `n_pass`;
+  the parity-gated dedup-cache fix makes it single-pass regardless. Not blocking.
+
+---
+
+
+## ⚠️ SMOKE-TEST RESULT (2026-06-24): native `gr.Progress` does NOT render here
+
+Live smoke-test (15 s clip, restarted app) — **Option X cannot show a visible bar in this app**:
+- Sink CONFIRMED firing: logs show `registered per-clip progress sink (n_pass=1, on_spaces=False)` and
+  `PROGRESS_SINK fired (clip 1/30)` → `progress(frac, desc)` IS being called every clip.
+- Yet the DOM has **zero** `.progress-bar`/`.progress-level` elements, **zero** "Encoding video · clip k/N"
+  text, and Gradio's `[data-testid="status-tracker"]` stays `class="...hide"` with **empty** innerHTML.
+- Salvage attempt FAILED: converting the handler lambda→`def _run_video(..., progress=gr.Progress())`
+  **and** adding explicit `show_progress="full"` did NOT make the determinate bar render. The custom
+  indeterminate `co-loading-bar` (which Option X removed) was the only thing ever visible.
+
+**Conclusion:** the native determinate bar doesn't render in this loading-card layout regardless of
+lambda/def or show_progress. To get a VISIBLE determinate bar we must drive the **card's own HTML**.
+
+## Architecture fork for the card-driven bar (for tribe-brain)
+
+The encode (`_gpu_infer`) is a single BLOCKING call; the per-clip signal comes from deep inside it (the
+sink). Two ways to push that into the visible card HTML:
+
+- **(Y) generator + worker thread:** `_score_impl` becomes a generator; run `_gpu_infer` in a
+  `threading.Thread`; poll the sink's shared counter; `yield` updated loading-card HTML every ~0.3 s.
+  Risk tribe-brain previously flagged: threading×MPS, and a generator feeding the existing
+  `.then(_reveal_result)` 6.11 visibility-drop chain.
+- **(T) gr.Timer poll:** the sink writes a module-global `{active,done,total,pass,n_pass}`; a
+  `gr.Timer(~0.3s)` handler reads it and returns updated loading-card HTML. No manual thread. BUT
+  `run_local.py` sets `.queue(default_concurrency_limit=1)` → the Timer event can't run while the Score
+  event holds the only worker UNLESS the Timer gets its own concurrency lane; need to confirm a
+  lightweight Timer event can run concurrently with the limit-1 Score without letting two Scores overlap
+  (GPU-memory invariant: never two encodes at once).
+
+Both are pure-app changes (no model/data change). Decision + must-fixes needed to one-shot it.
+
+---
+
+**(superseded) Prior status:** DECIDED → implemented Option X; the live smoke-test then disproved X.
 
 ## DECISION (tribe-brain-reviewed, operator-confirmed)
 

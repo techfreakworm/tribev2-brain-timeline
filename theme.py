@@ -385,28 +385,30 @@ CSS: str = """
 }
 .co-state.co-state-error .co-state-title { color: var(--co-error); }
 
-/* Loading: theme Gradio's native gr.Progress widget to the amber accent so the
-   real per-clip determinate bar (app.py per-clip sink) matches the card. The
-   old indeterminate .co-loading-bar scan-line is gone — the native bar is the
-   single source of truth. Class names span Gradio's progress markup defensively
-   (the determinate fill + the "clip k/N · window p/P" label). */
-.progress-bar,
-.progress-level .progress-level-inner,
-.progress-level-inner,
-.meta-text + .progress-bar {
-    background: var(--co-amber) !important;
-    color: var(--co-accent-text, #0E1116) !important;
+/* Loading: a DETERMINATE in-card progress bar (Option T). Gradio's native
+   gr.Progress bar does not render in this loading-card layout (smoke-test
+   confirmed), so a gr.Timer re-renders the card HTML with this amber fill bar
+   driven by the live per-clip encode state. */
+.co-prog-track {
+    height: 6px;
+    border-radius: 4px;
+    background: var(--co-border);
+    margin: 16px auto 8px;
+    max-width: 460px;
+    overflow: hidden;
 }
-.progress-text,
-.meta-text,
-.meta-text-center {
-    color: var(--co-amber) !important;
-    font-family: var(--co-mono, ui-monospace, monospace) !important;
-    letter-spacing: 0.01em;
+.co-prog-fill {
+    height: 100%;
+    border-radius: 4px;
+    background: linear-gradient(90deg, var(--co-amber), #FFD9A0);
+    box-shadow: 0 0 10px rgba(255,180,84,0.5);
+    transition: width 0.3s linear;
 }
-.progress-level {
-    background: var(--co-border) !important;
-    border-radius: 3px;
+.co-prog-pct {
+    font-family: var(--co-mono, ui-monospace, monospace);
+    font-size: 12.5px;
+    color: var(--co-amber);
+    letter-spacing: 0.02em;
 }
 
 /* ---- Proxy / honesty caveat (the value-region disclaimer, §5) ----------- */

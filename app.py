@@ -112,9 +112,9 @@ from tribescore.inference import (
 )
 from tribescore.metrics import build_roi_masks, summary, to_metrics
 from tribescore.plotting import seek_js, timeline_figure
-from tribescore.progress import make_clip_sink
 from tribescore.windowing import plan_windows, stitch
 from tribescore import fast_encode
+from tribescore import progress as progress_state
 
 logger = logging.getLogger("tribescore.app")
 logging.basicConfig(level=logging.INFO)
@@ -374,6 +374,18 @@ def _reveal_result(ok: bool):
     return gr.update(visible=bool(ok))
 
 
+def _progress_tick():
+    """gr.Timer handler (Option T): while a video encode is active, re-render the
+    loading card with the live per-clip determinate bar; otherwise ``gr.skip()``
+    (no DOM churn when idle / on the Space). Runs in its own concurrency lane, so
+    it ticks in parallel with the limit-1 Score event (which alone runs the GPU
+    encode — the Timer never encodes, so two encodes can't overlap)."""
+    snap = progress_state.snapshot()
+    if not snap.get("active"):
+        return gr.skip()
+    return ui.loading_card_html(snap)
+
+
 def _fail(message: str):
     """Error update tuple (same 7 outputs + trailing ok=False for _reveal_result)."""
     return (
@@ -430,13 +442,18 @@ def _score_impl(mode, src_path, selected_names, audio_only, progress):
                 n_pass = max(1, len(plan_windows(dur))) if dur and dur > 0 else 1
             except Exception:
                 n_pass = 1
-            fast_encode.set_progress_sink(make_clip_sink(progress, n_pass))
+            # Option T: the encode sink writes per-clip counters into the live
+            # state dict; a gr.Timer reads it and re-renders the loading card.
+            progress_state.begin(n_pass)
+            fast_encode.set_progress_sink(progress_state.sink)
             _sink_set = True
+            logger.info("registered per-clip progress sink (n_pass=%d, on_spaces=%s)", n_pass, on_spaces())
         try:
             preds, abs_times, text_media, no_speech = _gpu_infer(mode, src_path, bool(audio_only))
         finally:
             if _sink_set:
                 fast_encode.clear_progress_sink()
+                progress_state.end()
 
         if preds.shape[0] == 0:
             return _fail(
@@ -548,12 +565,24 @@ def build_demo() -> gr.Blocks:
         score_outputs = result_outputs + [ok_state]
         js_seek = seek_js()
 
+        # Live in-card progress bar (Option T): a Timer reads the per-clip encode
+        # state ~3x/s and re-renders the loading card. Its own concurrency lane →
+        # ticks in parallel with the limit-1 Score; idle/Space → gr.skip().
+        prog_timer = gr.Timer(0.3)
+        prog_timer.tick(_progress_tick, inputs=None, outputs=[r["loading_body"]])
+
         # Sample clip → fill the Video component.
         v["sample_btn"].click(fn=lambda: SAMPLE_VIDEO_URL, inputs=None, outputs=[v["video"]])
 
         # --- Video ---
+        # def (not lambda) keeps gr.Progress injected for the Space's coarse stage
+        # bar (the Space fallback). Locally the native bar doesn't render, so the
+        # in-card determinate bar is driven by the gr.Timer below (Option T).
+        def _run_video(vid, metrics, ao, progress=gr.Progress()):
+            return _score_impl("video", vid, metrics, ao, progress)
+
         v["run_btn"].click(_enter_loading, None, loading_outputs).then(
-            lambda vid, metrics, ao, pr=gr.Progress(): _score_impl("video", vid, metrics, ao, pr),
+            _run_video,
             inputs=[v["video"], v["metrics"], v["audio_only"]],
             outputs=score_outputs,
         ).then(_reveal_result, inputs=[ok_state], outputs=[r["result_grp"]]).then(fn=None, js=js_seek)

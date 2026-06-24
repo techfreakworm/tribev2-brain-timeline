@@ -235,19 +235,11 @@ def build_results() -> dict[str, gr.components.Component]:
         empty = gr.HTML(_EMPTY_HTML, visible=True)
 
         # --- Loading ------------------------------------------------------
+        # A gr.Timer (app.py) re-renders this card ~3x/s with the live per-clip
+        # bar during a video encode (Option T — the native gr.Progress bar does
+        # not render in this layout). ``loading_body`` is the addressable target.
         with gr.Column(visible=False) as loading:
-            gr.HTML(
-                """
-                <div class="co-state">
-                  <div class="co-state-icon">&#128300;</div>
-                  <div class="co-state-title">Scoring&hellip;</div>
-                  <div class="co-state-body" id="co-progress">
-                    Extracting features and predicting cortical activity. This
-                    runs window-by-window over the clip — progress below.
-                  </div>
-                </div>
-                """.strip()
-            )
+            loading_body = gr.HTML(loading_card_html())
 
         # --- Error --------------------------------------------------------
         # app.py sets the inner text via this component's value on failure.
@@ -270,6 +262,7 @@ def build_results() -> dict[str, gr.components.Component]:
     return dict(
         empty=empty,
         loading=loading,
+        loading_body=loading_body,
         error=error,
         result_grp=result_grp,
         media_html=media_html,
@@ -283,6 +276,36 @@ def build_results() -> dict[str, gr.components.Component]:
 # Small HTML helpers app.py can call to render the dynamic states. Pure
 # string builders (no Gradio state) so they stay unit-checkable.
 # ---------------------------------------------------------------------------
+def loading_card_html(snap: dict | None = None) -> str:
+    """Render the 'Scoring…' card with a determinate in-card progress bar from a
+    live progress snapshot (``tribescore.progress.snapshot()``). Pure string
+    builder. The native ``gr.Progress`` bar does NOT render in this layout, so a
+    ``gr.Timer`` (app.py) drives this HTML directly every ~0.3 s (Option T)."""
+    snap = snap or {}
+    n = max(1, int(snap.get("n_pass", 1) or 1))
+    total = int(snap.get("total", 0) or 0)
+    done = int(snap.get("done", 0) or 0)
+    pass_idx = int(snap.get("pass_idx", 0) or 0)
+    within = (done / total) if total else 0.0
+    frac = min(1.0, max(0.0, (pass_idx + within) / n))
+    pct = int(round(frac * 100))
+    window = min(pass_idx + 1, n)
+    if total:
+        label = f"Encoding video &middot; clip {done}/{total} &middot; window {window}/{n}"
+    else:
+        label = "Extracting features and predicting cortical activity&hellip;"
+    return (
+        '<div class="co-state">'
+        '<div class="co-state-icon">&#128300;</div>'
+        '<div class="co-state-title">Scoring&hellip;</div>'
+        f'<div class="co-state-body" id="co-progress">{label}</div>'
+        '<div class="co-prog-track">'
+        f'<div class="co-prog-fill" style="width:{pct}%"></div></div>'
+        f'<div class="co-prog-pct">{pct}%</div>'
+        '</div>'
+    )
+
+
 def error_html(message: str) -> str:
     """Wrap an actionable, plain-voice message in the error-panel markup."""
     return (
