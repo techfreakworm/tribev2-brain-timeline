@@ -112,7 +112,9 @@ from tribescore.inference import (
 )
 from tribescore.metrics import build_roi_masks, summary, to_metrics
 from tribescore.plotting import seek_js, timeline_figure
-from tribescore.windowing import stitch
+from tribescore.progress import make_clip_sink
+from tribescore.windowing import plan_windows, stitch
+from tribescore import fast_encode
 
 logger = logging.getLogger("tribescore.app")
 logging.basicConfig(level=logging.INFO)
@@ -416,8 +418,25 @@ def _score_impl(mode, src_path, selected_names, audio_only, progress):
             if not str(src_path).strip():
                 return _fail("Enter some text to score.")
 
-        progress(0.15, desc="Running tribev2 on ZeroGPU (feature extraction + prediction)…")
-        preds, abs_times, text_media, no_speech = _gpu_infer(mode, src_path, bool(audio_only))
+        progress(0.15, desc="Running tribev2 (feature extraction + prediction)…")
+        # LOCAL (in-process) video path only: drive a smooth determinate bar over
+        # the 0.15->0.70 band, one tick per encoded clip. On the Space, _gpu_infer
+        # forks AFTER this point, so the child's encode loop can't see a parent-set
+        # sink — we DON'T register one there (the coarse stage calls remain the
+        # Space fallback), and _emit_progress no-ops on the dead callback regardless.
+        _sink_set = False
+        if mode == "video" and not on_spaces():
+            try:
+                n_pass = max(1, len(plan_windows(dur))) if dur and dur > 0 else 1
+            except Exception:
+                n_pass = 1
+            fast_encode.set_progress_sink(make_clip_sink(progress, n_pass))
+            _sink_set = True
+        try:
+            preds, abs_times, text_media, no_speech = _gpu_infer(mode, src_path, bool(audio_only))
+        finally:
+            if _sink_set:
+                fast_encode.clear_progress_sink()
 
         if preds.shape[0] == 0:
             return _fail(

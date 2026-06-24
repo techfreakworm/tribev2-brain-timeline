@@ -63,6 +63,39 @@ LAST_BACKBONE: dict = {"hit": None, "build_s": 0.0}
 _DEDUP_OUT_CACHE: dict = {}
 
 
+# --- per-clip progress sink (LOCAL in-process path only) --------------------
+#: app.py registers a best-effort callback so the V-JEPA2 encode loop can report
+#: (clips_done, clips_total) for a determinate progress bar. It must NEVER raise
+#: into the encode, and is a no-op when unset — the default, and the case on the
+#: HF Space where _gpu_infer runs in a fork that cannot see a parent-set sink.
+_PROGRESS_SINK = None
+
+
+def set_progress_sink(fn) -> None:
+    """Register a callable ``fn(done:int, total:int)`` invoked once per encoded
+    clip. Pass ``None`` (or call :func:`clear_progress_sink`) to disable."""
+    global _PROGRESS_SINK
+    _PROGRESS_SINK = fn
+
+
+def clear_progress_sink() -> None:
+    """Drop any registered progress sink (call in a ``finally`` after a run)."""
+    global _PROGRESS_SINK
+    _PROGRESS_SINK = None
+
+
+def _emit_progress(done: int, total: int) -> None:
+    """Best-effort per-clip progress emit; swallows everything (progress must
+    never abort scoring, and the Space fork may inherit a dead callback)."""
+    fn = _PROGRESS_SINK
+    if fn is None:
+        return
+    try:
+        fn(done, total)
+    except Exception:
+        pass
+
+
 def _register_layer_empty_cache_hooks(hf_model, every: int) -> int:
     """Register a forward-hook on each V-JEPA2 ENCODER layer that frees the
     per-layer attention transients during the forward, bounding the per-clip peak.
@@ -388,6 +421,8 @@ def apply_frame_dedup_encode() -> bool:
                     if not output.size:
                         output = np.zeros((len(times),) + embd.shape)
                     output[k] = embd
+                    # Per-clip progress (LOCAL only; no-op on the Space/when unset).
+                    _emit_progress(k + 1, len(clip_ts))
                     # Every ~8 clips, abort cleanly if system memory crosses the
                     # ceiling (e.g. another app grabbed RAM) — before the OS OOMs.
                     if _mps and k % 8 == 0:

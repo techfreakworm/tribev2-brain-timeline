@@ -385,26 +385,28 @@ CSS: str = """
 }
 .co-state.co-state-error .co-state-title { color: var(--co-error); }
 
-/* Loading: a thin indeterminate scan-line over the readout, not a bare spinner. */
-.co-loading-bar {
-    height: 3px;
-    border-radius: 3px;
-    overflow: hidden;
-    background: var(--co-border);
-    margin-top: 14px;
+/* Loading: theme Gradio's native gr.Progress widget to the amber accent so the
+   real per-clip determinate bar (app.py per-clip sink) matches the card. The
+   old indeterminate .co-loading-bar scan-line is gone — the native bar is the
+   single source of truth. Class names span Gradio's progress markup defensively
+   (the determinate fill + the "clip k/N · window p/P" label). */
+.progress-bar,
+.progress-level .progress-level-inner,
+.progress-level-inner,
+.meta-text + .progress-bar {
+    background: var(--co-amber) !important;
+    color: var(--co-accent-text, #0E1116) !important;
 }
-.co-loading-bar::after {
-    content: "";
-    display: block;
-    height: 100%;
-    width: 38%;
-    border-radius: 3px;
-    background: linear-gradient(90deg, transparent, var(--co-amber), transparent);
-    animation: co-scan 1.25s ease-in-out infinite;
+.progress-text,
+.meta-text,
+.meta-text-center {
+    color: var(--co-amber) !important;
+    font-family: var(--co-mono, ui-monospace, monospace) !important;
+    letter-spacing: 0.01em;
 }
-@keyframes co-scan {
-    0%   { transform: translateX(-120%); }
-    100% { transform: translateX(320%); }
+.progress-level {
+    background: var(--co-border) !important;
+    border-radius: 3px;
 }
 
 /* ---- Proxy / honesty caveat (the value-region disclaimer, §5) ----------- */
@@ -443,7 +445,6 @@ CSS: str = """
 
 @media (prefers-reduced-motion: reduce) {
     .co-quota .co-dot::before,
-    .co-loading-bar::after,
     .co-stat { animation: none !important; }
 }
 

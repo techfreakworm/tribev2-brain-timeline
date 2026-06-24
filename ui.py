@@ -243,9 +243,8 @@ def build_results() -> dict[str, gr.components.Component]:
                   <div class="co-state-title">Scoring&hellip;</div>
                   <div class="co-state-body" id="co-progress">
                     Extracting features and predicting cortical activity. This
-                    runs window-by-window over the clip.
+                    runs window-by-window over the clip — progress below.
                   </div>
-                  <div class="co-loading-bar"></div>
                 </div>
                 """.strip()
             )
