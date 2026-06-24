@@ -438,8 +438,16 @@ def _score_impl(mode, src_path, selected_names, audio_only, progress):
         # Space fallback), and _emit_progress no-ops on the dead callback regardless.
         _sink_set = False
         if mode == "video" and not on_spaces():
+            # Clear the dedup cache at Score start so a stale extraction (Gradio can
+            # reuse a temp upload path for a different file across Scores) is never
+            # served. The speedup is intra-Score, so this loses nothing.
+            fast_encode.clear_dedup_cache()
+            cache_on = bool(os.environ.get("TRIBE_DEDUP_CACHE"))
             try:
-                n_pass = max(1, len(plan_windows(dur))) if dur and dur > 0 else 1
+                # cache ON -> one extraction (the per-window predict calls all hit the
+                # cache) -> a single sink sweep -> n_pass=1 -> clean 0->100%.
+                # cache OFF -> the double-extract re-runs the loop, ~window-count sweeps.
+                n_pass = 1 if cache_on else (max(1, len(plan_windows(dur))) if dur and dur > 0 else 1)
             except Exception:
                 n_pass = 1
             # Option T: the encode sink writes per-clip counters into the live
@@ -447,7 +455,7 @@ def _score_impl(mode, src_path, selected_names, audio_only, progress):
             progress_state.begin(n_pass)
             fast_encode.set_progress_sink(progress_state.sink)
             _sink_set = True
-            logger.info("registered per-clip progress sink (n_pass=%d, on_spaces=%s)", n_pass, on_spaces())
+            logger.info("registered per-clip progress sink (n_pass=%d, cache=%s, on_spaces=%s)", n_pass, cache_on, on_spaces())
         try:
             preds, abs_times, text_media, no_speech = _gpu_infer(mode, src_path, bool(audio_only))
         finally:

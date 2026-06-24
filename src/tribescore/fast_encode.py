@@ -63,6 +63,14 @@ LAST_BACKBONE: dict = {"hit": None, "build_s": 0.0}
 _DEDUP_OUT_CACHE: dict = {}
 
 
+def clear_dedup_cache() -> None:
+    """Empty the dedup output cache. app.py calls this at the START of each Score
+    (local path) so a stale extraction can never be served — the whole speedup is
+    intra-Score (one extraction reused across that Score's per-window calls), and
+    Gradio can reuse a temp upload path for a different file across Scores."""
+    _DEDUP_OUT_CACHE.clear()
+
+
 # --- per-clip progress sink (LOCAL in-process path only) --------------------
 #: app.py registers a best-effort callback so the V-JEPA2 encode loop can report
 #: (clips_done, clips_total) for a determinate progress bar. It must NEVER raise
@@ -307,6 +315,13 @@ def apply_frame_dedup_encode() -> bool:
             try:
                 ckeys.append((
                     getattr(_ev, "filepath", None) or repr(_ev),
+                    # offset+duration (mirror exca's item_uid) make the key safe BY
+                    # CONSTRUCTION: the full-clip event has a fixed offset/duration so
+                    # every per-window call reuses it; if a WINDOWED event ever reached
+                    # here its key would differ -> cache MISS -> re-extract -> still
+                    # correct, never a silent wrong slice.
+                    getattr(_ev, "offset", getattr(_ev, "start", None)),
+                    getattr(_ev, "duration", None),
                     self.image.model_name, self.layer_type,
                     str(self.frequency), self.num_frames, self.max_imsize,
                 ))
