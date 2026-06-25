@@ -42,4 +42,27 @@ confidently-wrong advice; (2) proxy-on-a-proxy → only "real" once validated ag
 retention/share data (close the loop); (3) main build pieces = store raw/population stats, a
 reference-clip library, time-alignment, and the comparator view.
 
+**Why it's relative — the absolute-score ceiling (conceptual foundation).** Operator question: can
+tribev2 say a clip *is* exciting/boring in absolute terms, so a wholly-boring clip doesn't show misleading
+peaks? **No — absoluteness isn't recoverable**, for three stacked reasons:
+1. **fMRI has no absolute scale** — BOLD is % change from an arbitrary baseline; there is no "0–100 arousal
+   meter" in the ground truth.
+2. **tribev2 was trained on per-run z-scored fMRI** — it learned the *relative pattern* only; even its *raw*
+   output lives in a normalized space, with no notion of "this whole clip is more aroused than that one."
+3. Our pipeline then adds the **global z-score** (the seam fix); removing it still leaves (1) and (2).
+
+**Direct consequence (the operator's exact worry — and it's correct):** self-normalized curves **always**
+show internal peaks, *even in a boring clip*. An internal peak = "the most active moment *relative to this
+clip*," NOT real arousal — the model cannot tell you "the whole thing is flat." This is precisely why the
+comparator above must use **raw** (pre-self-z-score) output vs a reference population, validated against real
+retention/like data — not the z-scored curves.
+
+**Arousal ≠ valence.** Attention/Engagement/Virality are **arousal/engagement INTENSITY** proxies, not
+valence — they can't cleanly separate happy-excited from angry-excited, or calm-content from sad. So an
+absolute "happy vs sad" is **doubly** out of reach (weak/absent valence signal + no absolute scale).
+
+**Honest reframe of the goal:** "absolute arousal/happiness score" = impossible from this model;
+"**this clip is above/below a typical video**" = the achievable, honest version — i.e. exactly the
+exemplar/population comparator + IG-validation loop above.
+
 **Next step when prioritized:** tribe-brain to write the full Tier-1 design spec.
