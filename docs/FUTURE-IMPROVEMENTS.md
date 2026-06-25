@@ -44,25 +44,46 @@ reference-clip library, time-alignment, and the comparator view.
 
 **Why it's relative — the absolute-score ceiling (conceptual foundation).** Operator question: can
 tribev2 say a clip *is* exciting/boring in absolute terms, so a wholly-boring clip doesn't show misleading
-peaks? **No — absoluteness isn't recoverable**, for three stacked reasons:
+peaks? **No absolute affect score is recoverable** — but a cross-video *relative* one is more feasible than
+first assumed (see "What IS achievable" below). Why absolute is out of reach, three stacked reasons:
 1. **fMRI has no absolute scale** — BOLD is % change from an arbitrary baseline; there is no "0–100 arousal
    meter" in the ground truth.
-2. **tribev2 was trained on per-run z-scored fMRI** — it learned the *relative pattern* only; even its *raw*
-   output lives in a normalized space, with no notion of "this whole clip is more aroused than that one."
-3. Our pipeline then adds the **global z-score** (the seam fix); removing it still leaves (1) and (2).
+2. **tribev2 is an encoding model trained against a normalized target** — its reported accuracy is
+   R = corr(True, Predict), a correlation **blind to absolute scale**, and all in-silico results in the paper
+   are **z-scored contrast maps**. It carries no absolute-affect unit.
+3. Our pipeline then adds the **global z-score** (the seam fix); removing it still leaves (1) and (2). The
+   paper's own Discussion is humble — it models the brain as a **passive observer**, not an active agent, and
+   is fMRI-resolution-limited.
+
+**Activity ≠ affect (record so UI/comparator copy never overclaims).** The model predicts brain-ACTIVITY
+patterns — *which* regions respond and *when* — NOT "arousal / engagement / virality." Those friendly labels
+are OUR interpretation layer (predicted network activity → readable names). "High activity" = "these regions
+are predicted to respond now," not "the viewer is this aroused." Meta's own demo shows "Low/High activity" — a
+relative pattern display, not a calibrated affect meter.
 
 **Direct consequence (the operator's exact worry — and it's correct):** self-normalized curves **always**
 show internal peaks, *even in a boring clip*. An internal peak = "the most active moment *relative to this
-clip*," NOT real arousal — the model cannot tell you "the whole thing is flat." This is precisely why the
-comparator above must use **raw** (pre-self-z-score) output vs a reference population, validated against real
-retention/like data — not the z-scored curves.
+clip*," NOT real arousal — the model cannot tell you "the whole thing is flat."
 
-**Arousal ≠ valence.** Attention/Engagement/Virality are **arousal/engagement INTENSITY** proxies, not
+**Arousal ≠ valence.** Attention/Engagement/Virality are arousal/engagement **INTENSITY** proxies, not
 valence — they can't cleanly separate happy-excited from angry-excited, or calm-content from sad. So an
 absolute "happy vs sad" is **doubly** out of reach (weak/absent valence signal + no absolute scale).
 
-**Honest reframe of the goal:** "absolute arousal/happiness score" = impossible from this model;
-"**this clip is above/below a typical video**" = the achievable, honest version — i.e. exactly the
-exemplar/population comparator + IG-validation loop above.
+**What IS achievable — better-grounded than first assumed.** Cross-video *relative* comparison ("this clip
+drives more predicted activity than a typical clip") is **model-supported, not speculative**: the paper shows
+tribev2 is ONE model predicting a **consistent group-averaged target** that **generalizes zero-shot** (and
+predicts group-averaged responses better than individual ones), so its **raw** (pre-self-z-score) outputs live
+in a **consistent shared space across videos**. That puts the exemplar/population benchmark-comparator on firmer
+footing than "weak/unvalidated" — it still **requires validation against real retention/like data** (close the
+loop), but the consistent output space is real signal, not a guess. Build the comparator on **raw** output vs a
+reference population, never on the z-scored curves.
+
+**Honest reframe of the goal:** an "absolute arousal/happiness score" = impossible from this model;
+"**this clip is above/below a typical video** (in predicted brain activity)" = the achievable, paper-supported
+version, gated on real-data validation. Never frame it as absolute, and never as an "affect" meter.
+
+**Paper:** d'Ascoli et al. (2026), *A foundation model of vision, audition, and language for in-silico
+neuroscience* (TRIBE v2). Code github.com/facebookresearch/tribev2 · weights huggingface.co/facebook/tribev2 ·
+demo aidemos.atmeta.com/tribev2.
 
 **Next step when prioritized:** tribe-brain to write the full Tier-1 design spec.
