@@ -19,7 +19,14 @@ import logging
 import os
 import sys
 import tempfile
+import warnings
 from pathlib import Path
+
+# Gradio 6.11 calls Starlette's deprecated HTTP_422_UNPROCESSABLE_ENTITY constant in
+# queue_join_helper -> a StarletteDeprecationWarning on EVERY queue-join (every client
+# poll), which floods the HF Space logs. Harmless (stdout noise, not a RAM/disk risk)
+# but it buries real errors. Suppress just this one message (also quiets local logs).
+warnings.filterwarnings("ignore", message=r".*HTTP_422_UNPROCESSABLE_ENTITY.*")
 
 # Local Apple-silicon: let any op without an MPS kernel fall back to CPU instead
 # of raising. PyTorch reads this at ``import torch``, so it MUST be set before the
